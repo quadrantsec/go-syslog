@@ -83,7 +83,7 @@ func (s *Server) SetDatagramChannelSize(size int) {
 func defaultTlsPeerName(tlsConn *tls.Conn) (tlsPeer string, ok bool) {
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) <= 0 {
-		return "", false
+		return "", true
 	}
 	cn := state.PeerCertificates[0].Subject.CommonName
 	return cn, true
