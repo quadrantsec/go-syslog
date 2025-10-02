@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -189,8 +190,15 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 			}
 			connection, err := listener.Accept()
 			if err != nil {
+				log.Printf("Failed to accept network connection, "+
+					"proto=%s, addr=%s, error=%v",
+					listener.Addr().Network(), listener.Addr(), err,
+				)
 				continue
 			}
+			log.Printf("Accepted network connection, proto=%s, remote=%s, local=%s",
+				listener.Addr().Network(), connection.RemoteAddr(), connection.LocalAddr(),
+			)
 
 			s.goScanConnection(connection)
 		}
@@ -215,13 +223,23 @@ func (s *Server) goScanConnection(connection net.Conn) {
 	if tlsConn, ok := connection.(*tls.Conn); ok {
 		// Handshake now so we get the TLS peer information
 		if err := tlsConn.Handshake(); err != nil {
+			log.Printf("Failed to complete TLS handshake, closing connection, "+
+				"remote=%s, local=%s, error=%v",
+				tlsConn.RemoteAddr(), tlsConn.LocalAddr(), err,
+			)
 			connection.Close()
 			return
 		}
+		log.Printf("TLS handshake complete, remote=%s, local=%s",
+			tlsConn.RemoteAddr(), tlsConn.LocalAddr(),
+		)
 		if s.tlsPeerNameFunc != nil {
 			var ok bool
 			tlsPeer, ok = s.tlsPeerNameFunc(tlsConn)
 			if !ok {
+				log.Printf("Failed to get TLS peer name, closing connection, "+
+					"remote=%s, local=%s", tlsConn.RemoteAddr(), tlsConn.LocalAddr(),
+				)
 				connection.Close()
 				return
 			}
