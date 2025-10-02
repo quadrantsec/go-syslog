@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -190,28 +191,25 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 			}
 			connection, err := listener.Accept()
 			if err != nil {
-				log.Printf("Failed to accept network connection, "+
+				log.Printf("Failed to accept connection, "+
 					"proto=%s, addr=%s, error=%v",
 					listener.Addr().Network(), listener.Addr(), err,
 				)
 				continue
 			}
-			log.Printf("Accepted network connection, proto=%s, remote=%s, local=%s",
+			log.Printf("Accepted connection, proto=%s, remote=%s, local=%s",
 				listener.Addr().Network(), connection.RemoteAddr(), connection.LocalAddr(),
 			)
 
-			s.goScanConnection(connection)
+			s.goReadConnection(connection)
 		}
 
 		s.wait.Done()
 	}(listener)
 }
 
-func (s *Server) goScanConnection(connection net.Conn) {
-	scanner := bufio.NewScanner(connection)
-	if sf := s.format.GetSplitFunc(); sf != nil {
-		scanner.Split(sf)
-	}
+func (s *Server) goReadConnection(connection net.Conn) {
+	reader := bufio.NewReader(connection)
 
 	remoteAddr := connection.RemoteAddr()
 	var client string
@@ -246,14 +244,13 @@ func (s *Server) goScanConnection(connection net.Conn) {
 		}
 	}
 
-	var scanCloser *ScanCloser
-	scanCloser = &ScanCloser{scanner, connection}
+	readCloser := &ReadCloser{reader, connection}
 
 	s.wait.Add(1)
-	go s.scan(scanCloser, client, tlsPeer)
+	go s.read(readCloser, client, tlsPeer)
 }
 
-func (s *Server) scan(scanCloser *ScanCloser, client string, tlsPeer string) {
+func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
 loop:
 	for {
 		select {
@@ -262,15 +259,33 @@ loop:
 		default:
 		}
 		if s.readTimeoutMilliseconds > 0 {
-			scanCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
+			readCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
 		}
-		if scanCloser.Scan() {
-			s.parser([]byte(scanCloser.Text()), client, tlsPeer)
-		} else {
+		// Read up to and including first '<'
+		token, err := readCloser.ReadString('<')
+		if token != "" {
+			// Re-add delimiter to start; remove from end
+			token = "<" + token[:len(token)-1]
+			// Parse as syslog
+			s.parser([]byte(token), client, tlsPeer)
+		}
+		// Break loop on error
+		if err != nil {
+			if err == io.EOF {
+				log.Println("EOF when reading token")
+			} else {
+				log.Printf("Error when reading token: %v", err)
+			}
 			break loop
 		}
 	}
-	scanCloser.closer.Close()
+	// Close connection
+	if conn, ok := readCloser.closer.(net.Conn); ok {
+		log.Printf("Closing connection, proto=%s, remote=%s, local=%s",
+			conn.LocalAddr().Network(), conn.RemoteAddr(), conn.LocalAddr(),
+		)
+	}
+	readCloser.closer.Close()
 
 	s.wait.Done()
 }
@@ -336,8 +351,8 @@ type TimeoutCloser interface {
 	SetReadDeadline(t time.Time) error
 }
 
-type ScanCloser struct {
-	*bufio.Scanner
+type ReadCloser struct {
+	*bufio.Reader
 	closer TimeoutCloser
 }
 
