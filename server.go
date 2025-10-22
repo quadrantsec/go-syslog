@@ -251,6 +251,7 @@ func (s *Server) goReadConnection(connection net.Conn) {
 }
 
 func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
+	i := 0
 loop:
 	for {
 		select {
@@ -261,10 +262,10 @@ loop:
 		if s.readTimeoutMilliseconds > 0 {
 			readCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
 		}
-		// Read up to and including first '<'
+		// Read up to and including '<' delimiter
 		token, err := readCloser.ReadString('<')
-		if token != "" {
-			// Re-add delimiter to start; remove from end
+		if token != "" && i > 0 { // Skip traffic that doesnt start with '<'
+			// Re-add '<' to start; remove from end
 			token = "<" + token[:len(token)-1]
 			// Parse as syslog
 			s.parser([]byte(token), client, tlsPeer)
@@ -278,6 +279,7 @@ loop:
 			}
 			break loop
 		}
+		i++
 	}
 	// Close connection
 	if conn, ok := readCloser.closer.(net.Conn); ok {
