@@ -294,7 +294,7 @@ loop:
 func readToken(readCloser *ReadCloser) (string, error) {
 	var buf bytes.Buffer
 	for {
-		// Read through first angle bracket
+		// Read until angle bracket
 		b, err := readCloser.ReadBytes('<')
 		if len(b) > 0 {
 			// Shift bracket to head
@@ -304,26 +304,16 @@ func readToken(readCloser *ReadCloser) (string, error) {
 		if err != nil {
 			return buf.String(), err
 		}
-		// Keep reading if not priority header
-		peek, err := readCloser.Peek(7)
+		// Stop if valid priority header
+		peek, err := readCloser.Peek(4)
 		if err != nil {
 			continue
 		}
-		ind := bytes.IndexByte(peek[:4], '>')
+		ind := bytes.IndexByte(peek, '>')
 		if ind < 0 {
 			continue
 		}
-		if !isValidPriority(peek[:ind]) {
-			continue
-		}
-		// Stop reading if followed by expected characters
-		chars := peek[ind+1 : ind+4]
-		if isValidMonth(chars) {
-			// RFC3164 expected
-			break
-		}
-		if isDigit(chars[0]) && isSpace(chars[1]) && isDigit(chars[2]) {
-			// RFC5424 expected
+		if isValidPriority(peek[:ind]) {
 			break
 		}
 	}
@@ -355,69 +345,15 @@ func isValidPriority(b []byte) bool {
 	return true
 }
 
-func isDigit(c byte) bool {
-	return c >= '0' && c <= '9'
-}
-
-func isSpace(c byte) bool {
-	return c == ' '
-}
-
-func isValidMonth(b []byte) bool {
-	// Month must be 3 characters
-	if len(b) != 3 {
-		return false
-	}
-	switch {
-	// Jan, Jun, Jul
-	case b[0] == 'J':
-		if b[1] == 'u' {
-			if b[2] == 'n' || b[2] == 'l' {
-				return true
-			}
-			return false
-		}
-		if b[1] == 'a' && b[2] == 'n' {
-			return true
-		}
-		return false
-	// Mar, May
-	case b[0] == 'M' && b[1] == 'a':
-		if b[2] == 'r' || b[2] == 'y' {
-			return true
-		}
-		return false
-	// Apr, Aug
-	case b[0] == 'A':
-		if b[1] == 'p' && b[2] == 'r' {
-			return true
-		}
-		if b[1] == 'u' && b[2] == 'g' {
-			return true
-		}
-		return false
-	// Feb
-	case b[0] == 'F' && b[1] == 'e' && b[2] == 'b':
-		return true
-	// Sep
-	case b[0] == 'S' && b[1] == 'e' && b[2] == 'p':
-		return true
-	// Oct
-	case b[0] == 'O' && b[1] == 'c' && b[2] == 't':
-		return true
-	// Nov
-	case b[0] == 'N' && b[1] == 'o' && b[2] == 'v':
-		return true
-	// Dec
-	case b[0] == 'D' && b[1] == 'e' && b[2] == 'c':
-		return true
-	// None of the above
-	default:
-		return false
-	}
-}
-
 func (s *Server) parser(line []byte, client string, tlsPeer string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic when parsing syslog entry, "+
+				"entry=%s, error=%v",
+				string(line), r,
+			)
+		}
+	}()
 	parser := s.format.GetParser(line)
 	err := parser.Parse()
 	if err != nil {
