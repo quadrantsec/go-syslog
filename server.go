@@ -24,6 +24,8 @@ var (
 const (
 	datagramChannelBufferSize = 10
 	datagramReadBufferSize    = 64 * 1024
+	// A peer that connects and never sends a ClientHello must not hold the port.
+	handshakeTimeout = 10 * time.Second
 )
 
 // A function type which gets the TLS peer name from the connection. Can return
@@ -201,7 +203,13 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 				listener.Addr().Network(), connection.RemoteAddr(), connection.LocalAddr(),
 			)
 
-			s.goReadConnection(connection)
+			// Handshake and read on their own goroutine. Doing this inline
+			// blocks Accept for every other connection on the listener.
+			s.wait.Add(1)
+			go func(conn net.Conn) {
+				defer s.wait.Done()
+				s.goReadConnection(conn)
+			}(connection)
 		}
 
 		s.wait.Done()
@@ -219,8 +227,12 @@ func (s *Server) goReadConnection(connection net.Conn) {
 
 	tlsPeer := ""
 	if tlsConn, ok := connection.(*tls.Conn); ok {
-		// Handshake now so we get the TLS peer information
-		if err := tlsConn.Handshake(); err != nil {
+		// Bound the handshake, then clear it so the syslog read can block
+		// for the configured idle timeout instead of the handshake budget.
+		_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
+		err := tlsConn.Handshake()
+		_ = tlsConn.SetDeadline(time.Time{})
+		if err != nil {
 			log.Printf("Failed to complete TLS handshake, closing connection, "+
 				"remote=%s, local=%s, error=%v",
 				tlsConn.RemoteAddr(), tlsConn.LocalAddr(), err,
