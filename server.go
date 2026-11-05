@@ -2,7 +2,6 @@ package syslog
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -252,7 +251,6 @@ func (s *Server) goReadConnection(connection net.Conn) {
 }
 
 func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
-	i := 0
 loop:
 	for {
 		select {
@@ -263,13 +261,10 @@ loop:
 		if s.readTimeoutMilliseconds > 0 {
 			readCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
 		}
-		// Read token
 		token, err := readToken(readCloser)
-		if i > 0 && token != "" { // Skip initial read and empty tokens
-			// Parse as syslog
+		if token != "" {
 			s.parser([]byte(token), client, tlsPeer)
 		}
-		// Stop reading on error
 		if err != nil {
 			if err == io.EOF {
 				log.Println("EOF when reading token")
@@ -278,10 +273,9 @@ loop:
 			}
 			break loop
 		}
-		i++
 	}
 	// Close connection
-	if conn, ok := readCloser.closer.(net.Conn); ok {
+	if conn, ok := readCloser.closer.(net.Conn); ok && conn.LocalAddr() != nil && conn.RemoteAddr() != nil {
 		log.Printf("Closing connection, proto=%s, remote=%s, local=%s",
 			conn.LocalAddr().Network(), conn.RemoteAddr(), conn.LocalAddr(),
 		)
@@ -292,57 +286,17 @@ loop:
 }
 
 func readToken(readCloser *ReadCloser) (string, error) {
-	var buf bytes.Buffer
-	for {
-		// Read until angle bracket
-		b, err := readCloser.ReadBytes('<')
-		if len(b) > 0 {
-			// Shift bracket to head
-			buf.WriteByte('<')
-			buf.Write(b[:len(b)-1])
-		}
-		if err != nil {
-			return buf.String(), err
-		}
-		// Stop if valid priority header
-		peek, err := readCloser.Peek(4)
-		if err != nil {
-			continue
-		}
-		ind := bytes.IndexByte(peek, '>')
-		if ind < 0 {
-			continue
-		}
-		if isValidPriority(peek[:ind]) {
-			break
-		}
+	b, err := readCloser.ReadBytes('\n')
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
 	}
-	return buf.String(), nil
-}
-
-func isValidPriority(b []byte) bool {
-	// Priority must be between 1 and 3 characters
-	if len(b) < 1 || len(b) > 3 {
-		return false
+	if n := len(b); n > 0 && b[n-1] == '\r' {
+		b = b[:n-1]
 	}
-	// Priority must be composed of digits
-	for i := 0; i < len(b); i++ {
-		if b[i] < '0' || b[i] > '9' {
-			return false
-		}
+	if len(b) > 0 {
+		return string(b), nil
 	}
-	// Priority must not be greater than 191
-	if len(b) == 3 {
-		if b[0] > '1' {
-			return false
-		}
-		if b[0] == '1' && b[1] == '9' {
-			if b[2] > '1' {
-				return false
-			}
-		}
-	}
-	return true
+	return "", err
 }
 
 func (s *Server) parser(line []byte, client string, tlsPeer string) {
