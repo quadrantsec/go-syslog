@@ -119,7 +119,7 @@ func (s *ServerSuite) TestConnectionClose(c *C) {
 	server.SetFormat(RFC3164)
 	server.SetHandler(handler)
 	con := ConnMock{ReadData: []byte(exampleSyslog)}
-	server.goReadConnection(&con)
+	server.goReadConnection(&con, newConnInfo(&con))
 	server.Wait()
 	c.Check(con.isClosed.Load(), Equals, true)
 }
@@ -130,7 +130,7 @@ func (s *ServerSuite) TestConnectionUDPKill(c *C) {
 	server.SetFormat(RFC5424)
 	server.SetHandler(handler)
 	con := ConnMock{ReadData: []byte(exampleSyslog)}
-	server.goReadConnection(&con)
+	server.goReadConnection(&con, newConnInfo(&con))
 	c.Assert(server.Kill(), IsNil)
 	server.Wait()
 	c.Check(con.isClosed.Load(), Equals, true)
@@ -144,7 +144,7 @@ func (s *ServerSuite) TestTcpTimeout(c *C) {
 	server.SetTimeout(10)
 	con := ConnMock{ReadData: []byte(exampleSyslog), ReturnTimeout: true}
 	c.Check(con.isReadDeadline.Load(), Equals, false)
-	server.goReadConnection(&con)
+	server.goReadConnection(&con, newConnInfo(&con))
 	server.Wait()
 	c.Check(con.isReadDeadline.Load(), Equals, true)
 	c.Check(handler.LastLogParts, IsNil)

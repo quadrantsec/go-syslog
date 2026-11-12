@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	proxyproto "github.com/pires/go-proxyproto"
 )
 
 // ConnEvent is a stage in a stream connection's life, reported to a ConnHook.
@@ -40,10 +42,12 @@ func (e ConnEvent) String() string {
 	return "unknown"
 }
 
-// ConnHook is told about each stream connection's events, for counters and
-// status pages. It runs on the connection's goroutine, so it must be quick
-// and must not block. err is set only for ConnHandshakeFailed.
-type ConnHook func(ev ConnEvent, conn net.Conn, err error)
+// ConnHook is told about each stream connection's events, for counters,
+// status pages and one-line connection logs. info is the same pointer for
+// every event of a connection and stays readable (Snapshot) while it runs;
+// at ConnClosed it is complete. It runs on the connection's goroutine, so it
+// must be quick and must not block. err is set only for ConnHandshakeFailed.
+type ConnHook func(ev ConnEvent, info *ConnInfo, err error)
 
 // SetConnHook sets the hook for stream connection events. Set it before Boot.
 func (s *Server) SetConnHook(hook ConnHook) {
@@ -53,7 +57,7 @@ func (s *Server) SetConnHook(hook ConnHook) {
 // connEvent calls the hook. A panicking hook is logged and ignored: it's
 // called from the connection's own panic recovery too, where a second panic
 // would take down the whole process.
-func (s *Server) connEvent(ev ConnEvent, conn net.Conn, err error) {
+func (s *Server) connEvent(ev ConnEvent, info *ConnInfo, err error) {
 	if s.connHook == nil {
 		return
 	}
@@ -62,7 +66,22 @@ func (s *Server) connEvent(ev ConnEvent, conn net.Conn, err error) {
 			log.Printf("Recovered from panic in connection hook, event=%s, error=%v", ev, r)
 		}
 	}()
-	s.connHook(ev, conn, err)
+	s.connHook(ev, info, err)
+}
+
+// SetQuietConnLogs stops the per-connection log lines (accepted, handshake
+// complete or failed, peer refused, reading stopped, closing), for a caller
+// that logs one line per connection from its ConnHook instead. Accept
+// errors, panics and dropped or skipped data are still logged.
+func (s *Server) SetQuietConnLogs(quiet bool) {
+	s.quietConnLogs = quiet
+}
+
+// connLog logs a per-connection line unless SetQuietConnLogs is on.
+func (s *Server) connLog(format string, args ...any) {
+	if !s.quietConnLogs {
+		log.Printf(format, args...)
+	}
 }
 
 // HandshakeFailure classifies a failed TLS handshake for logs and counters:
@@ -84,6 +103,12 @@ func HandshakeFailure(err error) (reason, hint string) {
 	}
 	if errors.Is(err, syscall.ECONNRESET) {
 		return "reset", "the client reset the connection during the handshake"
+	}
+	if errors.Is(err, proxyproto.ErrSuperfluousProxyHeader) {
+		return "untrusted_proxy_header", "a PROXY protocol header from an address that isn't a trusted proxy; refused"
+	}
+	if strings.HasPrefix(err.Error(), "proxyproto:") {
+		return "bad_proxy_header", "a malformed or unsupported PROXY protocol header from the trusted proxy"
 	}
 	msg := err.Error()
 	for _, c := range handshakeFailures {

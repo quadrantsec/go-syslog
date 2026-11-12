@@ -41,6 +41,9 @@ type frameReader struct {
 	streak int
 	// logf reports dropped or skipped data. It may be nil.
 	logf func(format string, args ...any)
+	// info counts dropped and skipped data and records the framing. It may
+	// be nil.
+	info *ConnInfo
 	// scratch accumulates a non-transparent frame across buffer refills,
 	// so a long message is copied once instead of regrown.
 	scratch []byte
@@ -84,6 +87,7 @@ func (f *frameReader) next() ([]byte, error) {
 			// next frame.
 			if skip, sn, ok := f.suffixCount(hdr - 1); ok {
 				f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", skip)
+				f.info.dropped(skip, 0)
 				_, _ = f.r.Discard(skip)
 				hdr -= skip
 				n = sn
@@ -93,6 +97,7 @@ func (f *frameReader) next() ([]byte, error) {
 				// one would discard n bytes of what are probably good
 				// frames, so drop the header and resync on the next call.
 				f.log("Skipped implausible octet count on octet-counted connection, length=%d, max_bytes=%d", n, f.max)
+				f.info.dropped(hdr, 0)
 				_, _ = f.r.Discard(hdr)
 				return nil, nil
 			}
@@ -103,6 +108,7 @@ func (f *frameReader) next() ([]byte, error) {
 			f.streak++
 		}
 		_, _ = f.r.Discard(hdr)
+		f.info.setFraming(FramingOctet)
 		return f.readCounted(n)
 	}
 
@@ -215,6 +221,7 @@ func (f *frameReader) readCounted(n int) ([]byte, error) {
 	if n > f.max {
 		// Drop it without buffering it, and carry on at the next frame.
 		f.log("Dropping oversized syslog frame, size_bytes=%d, max_bytes=%d", n, f.max)
+		f.info.dropped(n, 1)
 		_, err := f.r.Discard(n)
 		return nil, err
 	}
@@ -246,6 +253,9 @@ func (f *frameReader) readToTrailer() ([]byte, error) {
 				// may have no trailer: deliver it. Any other error (reset,
 				// timeout, Kill) cut the message short: drop it.
 				if errors.Is(err, io.EOF) {
+					if len(msg) > 0 {
+						f.info.setFraming(FramingEOF)
+					}
 					return f.finishTrailer(msg, dropped), err
 				}
 				return nil, err
@@ -263,6 +273,11 @@ func (f *frameReader) readToTrailer() ([]byte, error) {
 		}
 		msg = append(msg, body...)
 		if end >= 0 {
+			if chunk[end] == 0 {
+				f.info.setFraming(FramingNUL)
+			} else {
+				f.info.setFraming(FramingLF)
+			}
 			_, _ = f.r.Discard(end + 1)
 			return f.finishTrailer(msg, dropped), nil
 		}
@@ -276,6 +291,7 @@ func (f *frameReader) finishTrailer(msg []byte, dropped int) []byte {
 	if dropped > 0 {
 		f.log("Truncated oversized syslog message, max_bytes=%d, dropped_bytes=%d",
 			f.max, dropped)
+		f.info.truncated(dropped)
 	}
 	if n := len(msg); n > 0 && msg[n-1] == '\r' {
 		msg = msg[:n-1]
@@ -293,6 +309,7 @@ func (f *frameReader) resync() (bool, error) {
 	defer func() {
 		if skipped > 0 {
 			f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", skipped)
+			f.info.dropped(skipped, 0)
 		}
 	}()
 	for skipped < f.max {
