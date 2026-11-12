@@ -2,7 +2,6 @@ package syslog
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -25,6 +24,12 @@ var (
 const (
 	datagramChannelBufferSize = 10
 	datagramReadBufferSize    = 64 * 1024
+
+	// DefaultHandshakeTimeout bounds the TLS handshake. A peer that connects
+	// and never sends a ClientHello must not hold a goroutine forever.
+	DefaultHandshakeTimeout = 10 * time.Second
+
+	maxAcceptBackoff = time.Second
 )
 
 // A function type which gets the TLS peer name from the connection. Can return
@@ -40,37 +45,64 @@ type Server struct {
 	datagramChannel         chan DatagramMessage
 	format                  format.Format
 	handler                 Handler
+	lastErrorMu             sync.Mutex
 	lastError               error
 	readTimeoutMilliseconds int64
+	handshakeTimeout        time.Duration
+	maxFrameSize            int
 	tlsPeerNameFunc         TlsPeerNameFunc
 	datagramPool            sync.Pool
+
+	// Open stream connections, so Kill can close them. Without this, Wait
+	// blocks until every peer disconnects on its own.
+	connsMu  sync.Mutex
+	conns    map[net.Conn]struct{}
+	stopping bool
+	killOnce sync.Once
 }
 
-//NewServer returns a new Server
+// NewServer returns a new Server
 func NewServer() *Server {
 	return &Server{tlsPeerNameFunc: defaultTlsPeerName, datagramPool: sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 65536)
+		New: func() any {
+			buf := make([]byte, 65536)
+			return &buf
 		},
 	},
 
 		datagramChannelSize: datagramChannelBufferSize,
+		handshakeTimeout:    DefaultHandshakeTimeout,
+		maxFrameSize:        DefaultMaxFrameSize,
+		conns:               make(map[net.Conn]struct{}),
 	}
 }
 
-//Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
+// Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
 func (s *Server) SetFormat(f format.Format) {
 	s.format = f
 }
 
-//Sets the handler, this handler with receive every syslog entry
+// Sets the handler, this handler with receive every syslog entry
 func (s *Server) SetHandler(handler Handler) {
 	s.handler = handler
 }
 
-//Sets the connection timeout for TCP connections, in milliseconds
+// Sets the connection timeout for TCP connections, in milliseconds
 func (s *Server) SetTimeout(millseconds int64) {
 	s.readTimeoutMilliseconds = millseconds
+}
+
+// Sets how long a TLS client gets to complete its handshake. Zero disables the
+// limit.
+func (s *Server) SetHandshakeTimeout(d time.Duration) {
+	s.handshakeTimeout = d
+}
+
+// Sets the largest syslog message accepted on a stream connection, in bytes.
+// Longer messages are truncated (non-transparent framing) or dropped (octet
+// counting).
+func (s *Server) SetMaxFrameSize(n int) {
+	s.maxFrameSize = n
 }
 
 // Set the function that extracts a TLS peer name from the TLS connection
@@ -92,7 +124,7 @@ func defaultTlsPeerName(tlsConn *tls.Conn) (tlsPeer string, ok bool) {
 	return cn, true
 }
 
-//Configure the server for listen on an UDP addr
+// Configure the server for listen on an UDP addr
 func (s *Server) ListenUDP(addr string) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -103,13 +135,13 @@ func (s *Server) ListenUDP(addr string) error {
 	if err != nil {
 		return err
 	}
-	connection.SetReadBuffer(datagramReadBufferSize)
+	_ = connection.SetReadBuffer(datagramReadBufferSize)
 
 	s.connections = append(s.connections, connection)
 	return nil
 }
 
-//Configure the server for listen on an unix socket
+// Configure the server for listen on an unix socket
 func (s *Server) ListenUnixgram(addr string) error {
 	unixAddr, err := net.ResolveUnixAddr("unixgram", addr)
 	if err != nil {
@@ -120,13 +152,13 @@ func (s *Server) ListenUnixgram(addr string) error {
 	if err != nil {
 		return err
 	}
-	connection.SetReadBuffer(datagramReadBufferSize)
+	_ = connection.SetReadBuffer(datagramReadBufferSize)
 
 	s.connections = append(s.connections, connection)
 	return nil
 }
 
-//Configure the server for listen on a TCP addr
+// Configure the server for listen on a TCP addr
 func (s *Server) ListenTCP(addr string) error {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -143,7 +175,7 @@ func (s *Server) ListenTCP(addr string) error {
 	return nil
 }
 
-//Configure the server for listen on a TCP addr for TLS
+// Configure the server for listen on a TCP addr for TLS
 func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
 	listener, err := tls.Listen("tcp", addr, config)
 	if err != nil {
@@ -155,7 +187,7 @@ func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
 	return nil
 }
 
-//Starts the server, all the go routines goes to live
+// Starts the server, all the go routines goes to live
 func (s *Server) Boot() error {
 	if s.format == nil {
 		return errors.New("please set a valid format")
@@ -181,35 +213,46 @@ func (s *Server) Boot() error {
 }
 
 func (s *Server) goAcceptConnection(listener net.Listener) {
-	s.wait.Add(1)
-	go func(listener net.Listener) {
-	loop:
+	s.wait.Go(func() {
+		var backoff time.Duration
 		for {
-			select {
-			case <-s.doneTcp:
-				break loop
-			default:
-			}
 			connection, err := listener.Accept()
 			if err != nil {
+				if s.isStopping() || errors.Is(err, net.ErrClosed) {
+					return
+				}
+				// Usually a temporary error such as too many open files.
+				// Back off instead of spinning on it.
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else if backoff *= 2; backoff > maxAcceptBackoff {
+					backoff = maxAcceptBackoff
+				}
 				log.Printf("Failed to accept connection, "+
 					"proto=%s, addr=%s, error=%v",
 					listener.Addr().Network(), listener.Addr(), err,
 				)
+				time.Sleep(backoff)
 				continue
 			}
+			backoff = 0
 			log.Printf("Accepted connection, proto=%s, remote=%s, local=%s",
 				listener.Addr().Network(), connection.RemoteAddr(), connection.LocalAddr(),
 			)
 
-			s.goReadConnection(connection)
+			// Handshake and read on the connection's own goroutine. Doing
+			// the handshake here would block Accept for every other
+			// connection on the listener until this peer spoke.
+			s.wait.Go(func() { s.goReadConnection(connection) })
 		}
-
-		s.wait.Done()
-	}(listener)
+	})
 }
 
 func (s *Server) goReadConnection(connection net.Conn) {
+	if !s.trackConn(connection) {
+		connection.Close()
+		return
+	}
 	reader := bufio.NewReader(connection)
 
 	remoteAddr := connection.RemoteAddr()
@@ -220,12 +263,19 @@ func (s *Server) goReadConnection(connection net.Conn) {
 
 	tlsPeer := ""
 	if tlsConn, ok := connection.(*tls.Conn); ok {
-		// Handshake now so we get the TLS peer information
-		if err := tlsConn.Handshake(); err != nil {
+		// Handshake now so we get the TLS peer information. Bound it, then
+		// clear the deadline so the syslog read gets the read timeout.
+		if s.handshakeTimeout > 0 {
+			_ = tlsConn.SetDeadline(time.Now().Add(s.handshakeTimeout))
+		}
+		err := tlsConn.Handshake()
+		_ = tlsConn.SetDeadline(time.Time{})
+		if err != nil {
 			log.Printf("Failed to complete TLS handshake, closing connection, "+
 				"remote=%s, local=%s, error=%v",
 				tlsConn.RemoteAddr(), tlsConn.LocalAddr(), err,
 			)
+			s.untrackConn(connection)
 			connection.Close()
 			return
 		}
@@ -239,6 +289,7 @@ func (s *Server) goReadConnection(connection net.Conn) {
 				log.Printf("Failed to get TLS peer name, closing connection, "+
 					"remote=%s, local=%s", tlsConn.RemoteAddr(), tlsConn.LocalAddr(),
 				)
+				s.untrackConn(connection)
 				connection.Close()
 				return
 			}
@@ -252,97 +303,110 @@ func (s *Server) goReadConnection(connection net.Conn) {
 }
 
 func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
-	i := 0
-loop:
-	for {
-		select {
-		case <-s.doneTcp:
-			break loop
-		default:
-		}
+	defer s.wait.Done()
+	conn, _ := readCloser.closer.(net.Conn)
+	frames := newFrameReader(readCloser.Reader, s.maxFrameSize)
+	frames.logf = func(format string, args ...any) {
+		log.Printf(format+", remote=%s, local=%s", append(args, connAddrs(conn)...)...)
+	}
+	for !s.isStopping() {
 		if s.readTimeoutMilliseconds > 0 {
-			readCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
+			_ = readCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
 		}
-		// Read token
-		token, err := readToken(readCloser)
-		if i > 0 && token != "" { // Skip initial read and empty tokens
-			// Parse as syslog
-			s.parser([]byte(token), client, tlsPeer)
+		msg, err := frames.next()
+		if len(msg) > 0 {
+			s.parser(msg, client, tlsPeer)
 		}
 		// Stop reading on error
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				log.Println("EOF when reading token")
 			} else {
 				log.Printf("Error when reading token: %v", err)
 			}
-			break loop
-		}
-		i++
-	}
-	// Close connection
-	if conn, ok := readCloser.closer.(net.Conn); ok {
-		log.Printf("Closing connection, proto=%s, remote=%s, local=%s",
-			conn.LocalAddr().Network(), conn.RemoteAddr(), conn.LocalAddr(),
-		)
-	}
-	readCloser.closer.Close()
-
-	s.wait.Done()
-}
-
-func readToken(readCloser *ReadCloser) (string, error) {
-	var buf bytes.Buffer
-	for {
-		// Read until angle bracket
-		b, err := readCloser.ReadBytes('<')
-		if len(b) > 0 {
-			// Shift bracket to head
-			buf.WriteByte('<')
-			buf.Write(b[:len(b)-1])
-		}
-		if err != nil {
-			return buf.String(), err
-		}
-		// Stop if valid priority header
-		peek, err := readCloser.Peek(4)
-		if err != nil {
-			continue
-		}
-		ind := bytes.IndexByte(peek, '>')
-		if ind < 0 {
-			continue
-		}
-		if isValidPriority(peek[:ind]) {
 			break
 		}
 	}
-	return buf.String(), nil
+	// Close connection
+	if conn != nil {
+		s.untrackConn(conn)
+		addrs := connAddrs(conn)
+		log.Printf("Closing connection, proto=%s, remote=%s, local=%s",
+			connNetwork(conn), addrs[0], addrs[1],
+		)
+	}
+	readCloser.closer.Close()
 }
 
-func isValidPriority(b []byte) bool {
-	// Priority must be between 1 and 3 characters
-	if len(b) < 1 || len(b) > 3 {
+// connAddrs returns the remote and local address of conn, tolerating nil.
+func connAddrs(conn net.Conn) []any {
+	var remote, local any = "", ""
+	if conn != nil {
+		if a := conn.RemoteAddr(); a != nil {
+			remote = a
+		}
+		if a := conn.LocalAddr(); a != nil {
+			local = a
+		}
+	}
+	return []any{remote, local}
+}
+
+func connNetwork(conn net.Conn) string {
+	if conn != nil {
+		if a := conn.LocalAddr(); a != nil {
+			return a.Network()
+		}
+	}
+	return ""
+}
+
+// trackConn records an open connection. It returns false once the server is
+// stopping, and the caller must close the connection.
+func (s *Server) trackConn(conn net.Conn) bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.stopping {
 		return false
 	}
-	// Priority must be composed of digits
-	for i := 0; i < len(b); i++ {
-		if b[i] < '0' || b[i] > '9' {
-			return false
-		}
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
 	}
-	// Priority must not be greater than 191
-	if len(b) == 3 {
-		if b[0] > '1' {
-			return false
-		}
-		if b[0] == '1' && b[1] == '9' {
-			if b[2] > '1' {
-				return false
-			}
-		}
-	}
+	s.conns[conn] = struct{}{}
 	return true
+}
+
+func (s *Server) untrackConn(conn net.Conn) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	delete(s.conns, conn)
+}
+
+func (s *Server) isStopping() bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	return s.stopping
+}
+
+// closeConns marks the server as stopping and closes every open connection.
+func (s *Server) closeConns() {
+	s.connsMu.Lock()
+	s.stopping = true
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	s.connsMu.Unlock()
+	for _, conn := range conns {
+		// Close the socket under TLS directly: tls.Conn.Close first writes
+		// a close_notify alert, which can wait on a peer that isn't reading.
+		// The read goroutine then fails and runs its own cleanup.
+		if tlsConn, ok := conn.(*tls.Conn); ok {
+			tlsConn.NetConn().Close()
+			continue
+		}
+		conn.Close()
+	}
 }
 
 func (s *Server) parser(line []byte, client string, tlsPeer string) {
@@ -357,7 +421,9 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 	parser := s.format.GetParser(line)
 	err := parser.Parse()
 	if err != nil {
+		s.lastErrorMu.Lock()
 		s.lastError = err
+		s.lastErrorMu.Unlock()
 	}
 
 	logParts := parser.Dump()
@@ -374,37 +440,42 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 	s.handler.Handle(logParts, int64(len(line)), err)
 }
 
-//Returns the last error
+// Returns the last error
 func (s *Server) GetLastError() error {
+	s.lastErrorMu.Lock()
+	defer s.lastErrorMu.Unlock()
 	return s.lastError
 }
 
-//Kill the server
+// Kill the server
 func (s *Server) Kill() error {
-	for _, connection := range s.connections {
-		err := connection.Close()
-		if err != nil {
-			return err
+	var firstErr error
+	s.killOnce.Do(func() {
+		// Mark stopping first, so a connection accepted while the
+		// listeners close is refused instead of left open.
+		s.closeConns()
+		for _, connection := range s.connections {
+			if err := connection.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
-
-	for _, listener := range s.listeners {
-		err := listener.Close()
-		if err != nil {
-			return err
+		for _, listener := range s.listeners {
+			if err := listener.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
-	// Only need to close channel once to broadcast to all waiting
-	if s.doneTcp != nil {
-		close(s.doneTcp)
-	}
-	if s.datagramChannel != nil {
-		close(s.datagramChannel)
-	}
-	return nil
+		// Only need to close channel once to broadcast to all waiting
+		if s.doneTcp != nil {
+			close(s.doneTcp)
+		}
+		if s.datagramChannel != nil {
+			close(s.datagramChannel)
+		}
+	})
+	return firstErr
 }
 
-//Waits until the server stops
+// Waits until the server stops
 func (s *Server) Wait() {
 	s.wait.Wait()
 }
@@ -425,11 +496,9 @@ type DatagramMessage struct {
 }
 
 func (s *Server) goReceiveDatagrams(packetconn net.PacketConn) {
-	s.wait.Add(1)
-	go func() {
-		defer s.wait.Done()
+	s.wait.Go(func() {
 		for {
-			buf := s.datagramPool.Get().([]byte)
+			buf := *s.datagramPool.Get().(*[]byte)
 			n, addr, err := packetconn.ReadFrom(buf)
 			if err == nil {
 				// Ignore trailing control characters and NULs
@@ -446,37 +515,30 @@ func (s *Server) goReceiveDatagrams(packetconn net.PacketConn) {
 				// there has been an error. Either the server has been killed
 				// or may be getting a transitory error due to (e.g.) the
 				// interface being shutdown in which case sleep() to avoid busy wait.
-				opError, ok := err.(*net.OpError)
-				if (ok) && !opError.Temporary() && !opError.Timeout() {
+				var opError *net.OpError
+				if errors.As(err, &opError) && !opError.Temporary() && !opError.Timeout() {
 					return
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
-	}()
+	})
 }
 
 func (s *Server) goParseDatagrams() {
 	s.datagramChannel = make(chan DatagramMessage, s.datagramChannelSize)
 
-	s.wait.Add(1)
-	go func() {
-		defer s.wait.Done()
-		for {
-			select {
-			case msg, ok := (<-s.datagramChannel):
-				if !ok {
-					return
+	s.wait.Go(func() {
+		for msg := range s.datagramChannel {
+			if sf := s.format.GetSplitFunc(); sf != nil {
+				if _, token, err := sf(msg.message, true); err == nil {
+					s.parser(token, msg.client, "")
 				}
-				if sf := s.format.GetSplitFunc(); sf != nil {
-					if _, token, err := sf(msg.message, true); err == nil {
-						s.parser(token, msg.client, "")
-					}
-				} else {
-					s.parser(msg.message, msg.client, "")
-				}
-				s.datagramPool.Put(msg.message[:cap(msg.message)])
+			} else {
+				s.parser(msg.message, msg.client, "")
 			}
+			buf := msg.message[:cap(msg.message)]
+			s.datagramPool.Put(&buf)
 		}
-	}()
+	})
 }
