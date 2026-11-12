@@ -2,6 +2,7 @@ package syslog
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -247,4 +248,24 @@ func TestIndexTrailer(t *testing.T) {
 			t.Errorf("indexTrailer(%q) = %d, want %d", in, got, want)
 		}
 	}
+}
+
+func benchmarkFrames(b *testing.B, frame string) {
+	stream := []byte(strings.Repeat(frame, 1000))
+	b.SetBytes(int64(len(stream)))
+	b.ReportAllocs()
+	for b.Loop() {
+		fr := newFrameReader(bufio.NewReader(bytes.NewReader(stream)), 0)
+		for {
+			if _, err := fr.next(); err != nil {
+				break
+			}
+		}
+	}
+}
+
+func BenchmarkFramesOctetCounted(b *testing.B) { benchmarkFrames(b, octet(sampleFortiGate1)) }
+func BenchmarkFramesNewline(b *testing.B)      { benchmarkFrames(b, sampleLinux+"\n") }
+func BenchmarkFramesLongNewline(b *testing.B) {
+	benchmarkFrames(b, "<134>"+strings.Repeat("x", 60000)+"\n")
 }

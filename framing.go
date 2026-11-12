@@ -38,6 +38,9 @@ type frameReader struct {
 	counted bool
 	// logf reports dropped or skipped data. It may be nil.
 	logf func(format string, args ...any)
+	// scratch accumulates a non-transparent frame across buffer refills,
+	// so a long message is copied once instead of regrown.
+	scratch []byte
 }
 
 func newFrameReader(r *bufio.Reader, max int) *frameReader {
@@ -147,7 +150,13 @@ func (f *frameReader) readCounted(n int) ([]byte, error) {
 // readToTrailer reads a non-transparent-framed message up to LF or NUL, or
 // up to EOF. Bytes beyond the cap are dropped up to the trailer.
 func (f *frameReader) readToTrailer() ([]byte, error) {
-	var msg []byte
+	msg := f.scratch[:0]
+	defer func() {
+		// Keep the grown buffer for the next frame, unless it's huge.
+		if cap(msg) <= 64<<10 {
+			f.scratch = msg[:0]
+		}
+	}()
 	dropped := 0
 	for {
 		if f.r.Buffered() == 0 {
@@ -174,6 +183,8 @@ func (f *frameReader) readToTrailer() ([]byte, error) {
 	}
 }
 
+// finishTrailer returns a copy of msg (which aliases the scratch buffer)
+// without a trailing CR.
 func (f *frameReader) finishTrailer(msg []byte, dropped int) []byte {
 	if dropped > 0 {
 		f.log("Truncated oversized syslog message, max_bytes=%d, dropped_bytes=%d",
@@ -182,7 +193,10 @@ func (f *frameReader) finishTrailer(msg []byte, dropped int) []byte {
 	if n := len(msg); n > 0 && msg[n-1] == '\r' {
 		msg = msg[:n-1]
 	}
-	return msg
+	if len(msg) == 0 {
+		return nil
+	}
+	return bytes.Clone(msg)
 }
 
 // resync skips bytes until the reader is at a '<' or at a valid octet count.

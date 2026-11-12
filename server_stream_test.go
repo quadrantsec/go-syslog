@@ -202,3 +202,44 @@ func TestTLSOctetCountedStream(t *testing.T) {
 		t.Errorf("hostname = %v", first["hostname"])
 	}
 }
+
+// An RFC 3164 sender on an RFC 5424 port fails to parse ("Invalid year in
+// timestamp") and was dropped by secure-syslog. With a fallback format it's
+// parsed as RFC 3164 instead.
+func TestFallbackFormat(t *testing.T) {
+	const line = "<38>Nov  9 15:00:01 web01 sshd[1234]: Accepted publickey for root"
+	for _, c := range []struct {
+		name     string
+		fallback format.Format
+		wantErr  bool
+	}{
+		{"without fallback", nil, true},
+		{"with fallback", Automatic, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := &errHandler{}
+			server := NewServer()
+			server.SetFormat(RFC5424)
+			server.SetFallbackFormat(c.fallback)
+			server.SetHandler(h)
+			server.parser([]byte(line), "192.0.2.1:5000", "")
+			if (h.err != nil) != c.wantErr {
+				t.Fatalf("err = %v, want error: %v", h.err, c.wantErr)
+			}
+			if !c.wantErr {
+				if h.parts["content"] != "Accepted publickey for root" || h.parts["hostname"] != "web01" {
+					t.Errorf("parts = %v", h.parts)
+				}
+			}
+		})
+	}
+}
+
+type errHandler struct {
+	parts format.LogParts
+	err   error
+}
+
+func (h *errHandler) Handle(lp format.LogParts, _ int64, err error) {
+	h.parts, h.err = lp, err
+}

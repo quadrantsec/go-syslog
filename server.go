@@ -44,6 +44,7 @@ type Server struct {
 	datagramChannelSize     int
 	datagramChannel         chan DatagramMessage
 	format                  format.Format
+	fallbackFormat          format.Format
 	handler                 Handler
 	lastErrorMu             sync.Mutex
 	lastError               error
@@ -80,6 +81,13 @@ func NewServer() *Server {
 // Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
 func (s *Server) SetFormat(f format.Format) {
 	s.format = f
+}
+
+// Sets a format to retry with when a message doesn't parse in the main
+// format, for example Automatic behind RFC5424 so an RFC 3164 sender on an
+// RFC 5424 port is still delivered instead of failing to parse.
+func (s *Server) SetFallbackFormat(f format.Format) {
+	s.fallbackFormat = f
 }
 
 // Sets the handler, this handler with receive every syslog entry
@@ -418,8 +426,14 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 			)
 		}
 	}()
-	parser := s.format.GetParser(line)
+	used := s.format
+	parser := used.GetParser(line)
 	err := parser.Parse()
+	if err != nil && s.fallbackFormat != nil {
+		if fallback := s.fallbackFormat.GetParser(line); fallback.Parse() == nil {
+			used, parser, err = s.fallbackFormat, fallback, nil
+		}
+	}
 	if err != nil {
 		s.lastErrorMu.Lock()
 		s.lastError = err
@@ -428,7 +442,7 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 
 	logParts := parser.Dump()
 	logParts["client"] = client
-	if logParts["hostname"] == "" && (s.format == RFC3164 || s.format == Automatic) {
+	if logParts["hostname"] == "" && (used == RFC3164 || used == Automatic) {
 		if i := strings.Index(client, ":"); i > 1 {
 			logParts["hostname"] = client[:i]
 		} else {
