@@ -56,7 +56,7 @@ type Severity struct {
 	Value int
 }
 
-type LogParts map[string]interface{}
+type LogParts map[string]any
 
 // https://tools.ietf.org/html/rfc3164#section-4.1
 func ParsePriority(buff []byte, cursor *int, l int) (Priority, error) {

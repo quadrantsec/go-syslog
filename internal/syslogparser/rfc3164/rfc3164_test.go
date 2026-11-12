@@ -2,6 +2,7 @@ package rfc3164
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -377,7 +378,7 @@ func (s *Rfc3164TestSuite) BenchmarkParsemessage(c *C) {
 
 	for i := 0; i < c.N; i++ {
 		_, err := p.parsemessage()
-		if err != syslogparser.ErrEOL {
+		if !errors.Is(err, syslogparser.ErrEOL) {
 			panic(err)
 		}
 

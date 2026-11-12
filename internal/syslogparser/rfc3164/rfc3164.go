@@ -2,6 +2,7 @@ package rfc3164
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"time"
 
@@ -48,11 +49,11 @@ func (p *Parser) Parse() error {
 	pri, err := p.parsePriority()
 	if err != nil {
 		// RFC3164 sec 4.3.3
-		p.priority = syslogparser.Priority{13, syslogparser.Facility{Value: 1}, syslogparser.Severity{Value: 5}}
+		p.priority = syslogparser.Priority{P: 13, F: syslogparser.Facility{Value: 1}, S: syslogparser.Severity{Value: 5}}
 		p.cursor = tcursor
 		content, err := p.parseContent()
 		p.header.timestamp = time.Now().Round(time.Second)
-		if err != syslogparser.ErrEOL {
+		if !errors.Is(err, syslogparser.ErrEOL) {
 			return err
 		}
 		p.message = rfc3164message{content: content}
@@ -61,7 +62,7 @@ func (p *Parser) Parse() error {
 
 	tcursor = p.cursor
 	hdr, err := p.parseHeader()
-	if err == syslogparser.ErrTimestampUnknownFormat {
+	if errors.Is(err, syslogparser.ErrTimestampUnknownFormat) {
 		// RFC3164 sec 4.3.2.
 		hdr.timestamp = time.Now().Round(time.Second)
 		// No tag processing should be done
@@ -75,7 +76,7 @@ func (p *Parser) Parse() error {
 	}
 
 	msg, err := p.parsemessage()
-	if err != syslogparser.ErrEOL {
+	if !errors.Is(err, syslogparser.ErrEOL) {
 		return err
 	}
 
@@ -136,7 +137,7 @@ func (p *Parser) parsemessage() (rfc3164message, error) {
 	}
 
 	content, err := p.parseContent()
-	if err != syslogparser.ErrEOL {
+	if !errors.Is(err, syslogparser.ErrEOL) {
 		return msg, err
 	}
 
@@ -249,7 +250,6 @@ func (p *Parser) parseTag() (string, error) {
 		if endOfTag {
 			if !found {
 				tag = p.buff[from:p.cursor]
-				found = true
 			}
 
 			p.cursor++

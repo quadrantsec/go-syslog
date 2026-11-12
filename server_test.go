@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,21 +28,21 @@ func (s *ServerSuite) TestTailFile(c *C) {
 	server := NewServer()
 	server.SetFormat(RFC3164)
 	server.SetHandler(handler)
-	server.ListenUDP("0.0.0.0:5141")
-	server.ListenTCP("0.0.0.0:5141")
+	c.Assert(server.ListenUDP("0.0.0.0:5141"), IsNil)
+	c.Assert(server.ListenTCP("0.0.0.0:5141"), IsNil)
 
 	go func(server *Server) {
 		time.Sleep(100 * time.Millisecond)
 
 		serverAddr, _ := net.ResolveUDPAddr("udp", "localhost:5141")
 		con, _ := net.DialUDP("udp", nil, serverAddr)
-		con.Write([]byte(exampleSyslog))
+		_, _ = con.Write([]byte(exampleSyslog))
 		time.Sleep(100 * time.Millisecond)
 
-		server.Kill()
+		_ = server.Kill()
 	}(server)
 
-	server.Boot()
+	c.Assert(server.Boot(), IsNil)
 	server.Wait()
 
 	c.Check(handler.LastLogParts["hostname"], Equals, "hostname")
@@ -66,8 +67,8 @@ func (s *HandlerMock) Handle(logParts format.LogParts, msgLen int64, err error) 
 type ConnMock struct {
 	ReadData       []byte
 	ReturnTimeout  bool
-	isClosed       bool
-	isReadDeadline bool
+	isClosed       atomic.Bool
+	isReadDeadline atomic.Bool
 }
 
 func (c *ConnMock) Read(b []byte) (n int, err error) {
@@ -87,7 +88,7 @@ func (c *ConnMock) Write(b []byte) (n int, err error) {
 }
 
 func (c *ConnMock) Close() error {
-	c.isClosed = true
+	c.isClosed.Store(true)
 	return nil
 }
 
@@ -104,7 +105,7 @@ func (c *ConnMock) SetDeadline(t time.Time) error {
 }
 
 func (c *ConnMock) SetReadDeadline(t time.Time) error {
-	c.isReadDeadline = true
+	c.isReadDeadline.Store(true)
 	return nil
 }
 
@@ -118,9 +119,9 @@ func (s *ServerSuite) TestConnectionClose(c *C) {
 	server.SetFormat(RFC3164)
 	server.SetHandler(handler)
 	con := ConnMock{ReadData: []byte(exampleSyslog)}
-	server.goScanConnection(&con)
+	server.goReadConnection(&con)
 	server.Wait()
-	c.Check(con.isClosed, Equals, true)
+	c.Check(con.isClosed.Load(), Equals, true)
 }
 
 func (s *ServerSuite) TestConnectionUDPKill(c *C) {
@@ -129,10 +130,10 @@ func (s *ServerSuite) TestConnectionUDPKill(c *C) {
 	server.SetFormat(RFC5424)
 	server.SetHandler(handler)
 	con := ConnMock{ReadData: []byte(exampleSyslog)}
-	server.goScanConnection(&con)
-	server.Kill()
+	server.goReadConnection(&con)
+	c.Assert(server.Kill(), IsNil)
 	server.Wait()
-	c.Check(con.isClosed, Equals, true)
+	c.Check(con.isClosed.Load(), Equals, true)
 }
 
 func (s *ServerSuite) TestTcpTimeout(c *C) {
@@ -142,10 +143,10 @@ func (s *ServerSuite) TestTcpTimeout(c *C) {
 	server.SetHandler(handler)
 	server.SetTimeout(10)
 	con := ConnMock{ReadData: []byte(exampleSyslog), ReturnTimeout: true}
-	c.Check(con.isReadDeadline, Equals, false)
-	server.goScanConnection(&con)
+	c.Check(con.isReadDeadline.Load(), Equals, false)
+	server.goReadConnection(&con)
 	server.Wait()
-	c.Check(con.isReadDeadline, Equals, true)
+	c.Check(con.isReadDeadline.Load(), Equals, true)
 	c.Check(handler.LastLogParts, IsNil)
 	c.Check(handler.LastMessageLength, Equals, int64(0))
 	c.Check(handler.LastError, IsNil)
@@ -310,8 +311,8 @@ func (s *ServerSuite) TestUDPRace(c *C) {
 	server.SetFormat(Automatic)
 	server.SetHandler(handler)
 	server.SetTimeout(10)
-	server.ListenUDP("127.0.0.1:0")
-	server.Boot()
+	c.Assert(server.ListenUDP("127.0.0.1:0"), IsNil)
+	c.Assert(server.Boot(), IsNil)
 	conn, err := net.Dial("udp", server.connections[0].LocalAddr().String())
 	c.Assert(err, IsNil)
 	_, err = conn.Write([]byte(exampleSyslog + "1"))
@@ -331,8 +332,8 @@ func (s *ServerSuite) TestTCPRace(c *C) {
 	server.SetFormat(Automatic)
 	server.SetHandler(handler)
 	server.SetTimeout(10)
-	server.ListenTCP("127.0.0.1:0")
-	server.Boot()
+	c.Assert(server.ListenTCP("127.0.0.1:0"), IsNil)
+	c.Assert(server.Boot(), IsNil)
 	conn, err := net.Dial("tcp", server.listeners[0].Addr().String())
 	c.Assert(err, IsNil)
 	_, err = conn.Write([]byte(exampleSyslog + "1\n"))
