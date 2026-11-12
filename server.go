@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -255,7 +256,10 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 			// Handshake and read on the connection's own goroutine. Doing
 			// the handshake here would block Accept for every other
 			// connection on the listener until this peer spoke.
-			s.wait.Go(func() { s.goReadConnection(connection) })
+			s.wait.Go(func() {
+				defer s.recoverConn(connection)
+				s.goReadConnection(connection)
+			})
 		}
 	})
 }
@@ -317,6 +321,16 @@ func (s *Server) goReadConnection(connection net.Conn) {
 func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
 	defer s.wait.Done()
 	conn, _ := readCloser.closer.(net.Conn)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic reading connection, closing it, remote=%s, local=%s, error=%v\n%s",
+				append(connAddrs(conn), r, debug.Stack())...)
+			if conn != nil {
+				s.untrackConn(conn)
+			}
+			readCloser.closer.Close()
+		}
+	}()
 	frames := newFrameReader(readCloser.Reader, s.maxFrameSize)
 	frames.logf = func(format string, args ...any) {
 		log.Printf(format+", remote=%s, local=%s", append(args, connAddrs(conn)...)...)
@@ -352,6 +366,18 @@ func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
 		)
 	}
 	readCloser.closer.Close()
+}
+
+// recoverConn turns a panic while setting up a connection (TLS handshake,
+// peer name) into a log line and a closed connection, instead of a crash of
+// the whole process and every other port with it.
+func (s *Server) recoverConn(conn net.Conn) {
+	if r := recover(); r != nil {
+		log.Printf("Recovered from panic handling connection, closing it, remote=%s, local=%s, error=%v\n%s",
+			append(connAddrs(conn), r, debug.Stack())...)
+		s.untrackConn(conn)
+		conn.Close()
+	}
 }
 
 // connAddrs returns the remote and local address of conn, tolerating nil.

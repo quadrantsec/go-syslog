@@ -159,7 +159,7 @@ func (p *Parser) parseTimestamp() (time.Time, error) {
 	}
 	// if timestamps starts with numeric try formats with different order
 	// it is more likely that timestamp is in RFC3339 format then
-	if c := p.buff[p.cursor]; c > '0' && c < '9' {
+	if p.cursor < p.l && p.buff[p.cursor] >= '0' && p.buff[p.cursor] <= '9' {
 		tsFmts = []string{
 			time.RFC3339,
 			time.Stamp,
@@ -231,7 +231,7 @@ func (p *Parser) parseTag() (string, error) {
 	from := p.cursor
 
 	for {
-		if p.cursor == p.l {
+		if p.cursor >= p.l {
 			// no tag found, reset cursor for content
 			p.cursor = from
 			return "", nil
