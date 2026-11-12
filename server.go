@@ -57,6 +57,7 @@ type Server struct {
 	handshakeTimeout        time.Duration
 	maxFrameSize            int
 	tlsPeerNameFunc         TlsPeerNameFunc
+	connHook                ConnHook
 	datagramPool            sync.Pool
 
 	// Open stream connections, so Kill can close them. Without this, Wait
@@ -252,6 +253,7 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 			log.Printf("Accepted connection, proto=%s, remote=%s, local=%s",
 				listener.Addr().Network(), connection.RemoteAddr(), connection.LocalAddr(),
 			)
+			s.connEvent(ConnAccepted, connection, nil)
 
 			// Handshake and read on the connection's own goroutine. Doing
 			// the handshake here would block Accept for every other
@@ -267,6 +269,7 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 func (s *Server) goReadConnection(connection net.Conn) {
 	if !s.trackConn(connection) {
 		connection.Close()
+		s.connEvent(ConnClosed, connection, nil)
 		return
 	}
 	reader := bufio.NewReader(connection)
@@ -287,17 +290,24 @@ func (s *Server) goReadConnection(connection net.Conn) {
 		err := tlsConn.Handshake()
 		s.armDeadline(func() { _ = tlsConn.SetDeadline(time.Time{}) })
 		if err != nil {
+			reason, hint := HandshakeFailure(err)
+			if hint != "" {
+				hint = ", hint=" + hint
+			}
 			log.Printf("Failed to complete TLS handshake, closing connection, "+
-				"remote=%s, local=%s, error=%v",
-				tlsConn.RemoteAddr(), tlsConn.LocalAddr(), err,
+				"remote=%s, local=%s, reason=%s, error=%v%s",
+				tlsConn.RemoteAddr(), tlsConn.LocalAddr(), reason, err, hint,
 			)
+			s.connEvent(ConnHandshakeFailed, connection, err)
 			s.untrackConn(connection)
 			connection.Close()
+			s.connEvent(ConnClosed, connection, nil)
 			return
 		}
 		log.Printf("TLS handshake complete, remote=%s, local=%s",
 			tlsConn.RemoteAddr(), tlsConn.LocalAddr(),
 		)
+		s.connEvent(ConnHandshakeOK, connection, nil)
 		if s.tlsPeerNameFunc != nil {
 			var ok bool
 			tlsPeer, ok = s.tlsPeerNameFunc(tlsConn)
@@ -307,6 +317,7 @@ func (s *Server) goReadConnection(connection net.Conn) {
 				)
 				s.untrackConn(connection)
 				connection.Close()
+				s.connEvent(ConnClosed, connection, nil)
 				return
 			}
 		}
@@ -329,6 +340,9 @@ func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
 				s.untrackConn(conn)
 			}
 			readCloser.closer.Close()
+			if conn != nil {
+				s.connEvent(ConnClosed, conn, nil)
+			}
 		}
 	}()
 	frames := newFrameReader(readCloser.Reader, s.maxFrameSize)
@@ -366,6 +380,9 @@ func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
 		)
 	}
 	readCloser.closer.Close()
+	if conn != nil {
+		s.connEvent(ConnClosed, conn, nil)
+	}
 }
 
 // recoverConn turns a panic while setting up a connection (TLS handshake,
@@ -377,6 +394,7 @@ func (s *Server) recoverConn(conn net.Conn) {
 			append(connAddrs(conn), r, debug.Stack())...)
 		s.untrackConn(conn)
 		conn.Close()
+		s.connEvent(ConnClosed, conn, nil)
 	}
 }
 
