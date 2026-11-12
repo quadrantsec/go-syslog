@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +59,8 @@ type Server struct {
 	maxFrameSize            int
 	tlsPeerNameFunc         TlsPeerNameFunc
 	connHook                ConnHook
+	quietConnLogs           bool
+	proxyTrusted            []netip.Prefix
 	datagramPool            sync.Pool
 
 	// Open stream connections, so Kill can close them. Without this, Wait
@@ -185,19 +188,23 @@ func (s *Server) ListenTCP(addr string) error {
 	}
 
 	s.doneTcp = make(chan bool)
-	s.listeners = append(s.listeners, listener)
+	s.listeners = append(s.listeners, s.proxyListener(listener))
 	return nil
 }
 
 // Configure the server for listen on a TCP addr for TLS
 func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
-	listener, err := tls.Listen("tcp", addr, config)
+	if config == nil || (len(config.Certificates) == 0 && config.GetCertificate == nil && config.GetConfigForClient == nil) {
+		return errors.New("tls: neither Certificates, GetCertificate, nor GetConfigForClient set in Config")
+	}
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 
+	// The PROXY header, if any, comes before the TLS handshake.
 	s.doneTcp = make(chan bool)
-	s.listeners = append(s.listeners, listener)
+	s.listeners = append(s.listeners, tls.NewListener(s.proxyListener(listener), config))
 	return nil
 }
 
@@ -250,38 +257,44 @@ func (s *Server) goAcceptConnection(listener net.Listener) {
 				continue
 			}
 			backoff = 0
-			log.Printf("Accepted connection, proto=%s, remote=%s, local=%s",
-				listener.Addr().Network(), connection.RemoteAddr(), connection.LocalAddr(),
-			)
-			s.connEvent(ConnAccepted, connection, nil)
-
-			// Handshake and read on the connection's own goroutine. Doing
-			// the handshake here would block Accept for every other
+			// Only the raw TCP addresses here: reading a PROXY header (or a
+			// TLS handshake) on the accept loop would block every other
 			// connection on the listener until this peer spoke.
+			info := newConnInfo(connection)
+			s.connLog("Accepted connection, proto=%s, remote=%s, local=%s",
+				listener.Addr().Network(), info.Peer, info.Local,
+			)
+			s.connEvent(ConnAccepted, info, nil)
+
 			s.wait.Go(func() {
-				defer s.recoverConn(connection)
-				s.goReadConnection(connection)
+				defer s.recoverConn(connection, info)
+				s.goReadConnection(connection, info)
 			})
 		}
 	})
 }
 
-func (s *Server) goReadConnection(connection net.Conn) {
+func (s *Server) goReadConnection(connection net.Conn, info *ConnInfo) {
 	if !s.trackConn(connection) {
 		connection.Close()
-		s.connEvent(ConnClosed, connection, nil)
+		info.close(CloseKilled, nil)
+		s.connEvent(ConnClosed, info, nil)
 		return
 	}
-	reader := bufio.NewReader(connection)
+	reader := bufio.NewReader(countingReader{connection, &info.bytes})
 
-	remoteAddr := connection.RemoteAddr()
-	var client string
-	if remoteAddr != nil {
-		client = remoteAddr.String()
-	}
+	// The stored client field is the TCP peer, even behind a trusted proxy:
+	// the client's address goes into ConnInfo only.
+	client := addrString(info.Peer)
 
 	tlsPeer := ""
-	if tlsConn, ok := connection.(*tls.Conn); ok {
+	tlsConn, isTLS := connection.(*tls.Conn)
+	if !isTLS {
+		if src := proxySource(connection); src != nil {
+			info.setSource(src)
+		}
+	}
+	if isTLS {
 		// Handshake now so we get the TLS peer information. Bound it, then
 		// clear the deadline so the syslog read gets the read timeout.
 		if s.handshakeTimeout > 0 {
@@ -294,30 +307,36 @@ func (s *Server) goReadConnection(connection net.Conn) {
 			if hint != "" {
 				hint = ", hint=" + hint
 			}
-			log.Printf("Failed to complete TLS handshake, closing connection, "+
+			s.connLog("Failed to complete TLS handshake, closing connection, "+
 				"remote=%s, local=%s, reason=%s, error=%v%s",
-				tlsConn.RemoteAddr(), tlsConn.LocalAddr(), reason, err, hint,
+				info.Peer, info.Local, reason, err, hint,
 			)
-			s.connEvent(ConnHandshakeFailed, connection, err)
+			info.close(CloseHandshakeFailed, err)
+			s.connEvent(ConnHandshakeFailed, info, err)
 			s.untrackConn(connection)
 			connection.Close()
-			s.connEvent(ConnClosed, connection, nil)
+			s.connEvent(ConnClosed, info, nil)
 			return
 		}
-		log.Printf("TLS handshake complete, remote=%s, local=%s",
-			tlsConn.RemoteAddr(), tlsConn.LocalAddr(),
+		info.setTLS(tlsConn.ConnectionState())
+		if src := proxySource(connection); src != nil {
+			info.setSource(src)
+		}
+		s.connLog("TLS handshake complete, remote=%s, local=%s%s",
+			info.Source(), info.Local, viaPeer(info),
 		)
-		s.connEvent(ConnHandshakeOK, connection, nil)
+		s.connEvent(ConnHandshakeOK, info, nil)
 		if s.tlsPeerNameFunc != nil {
 			var ok bool
 			tlsPeer, ok = s.tlsPeerNameFunc(tlsConn)
 			if !ok {
-				log.Printf("Failed to get TLS peer name, closing connection, "+
-					"remote=%s, local=%s", tlsConn.RemoteAddr(), tlsConn.LocalAddr(),
+				s.connLog("Failed to get TLS peer name, closing connection, "+
+					"remote=%s, local=%s%s", info.Source(), info.Local, viaPeer(info),
 				)
+				info.close(ClosePeerRejected, nil)
 				s.untrackConn(connection)
 				connection.Close()
-				s.connEvent(ConnClosed, connection, nil)
+				s.connEvent(ConnClosed, info, nil)
 				return
 			}
 		}
@@ -326,28 +345,36 @@ func (s *Server) goReadConnection(connection net.Conn) {
 	readCloser := &ReadCloser{reader, connection}
 
 	s.wait.Add(1)
-	go s.read(readCloser, client, tlsPeer)
+	go s.read(readCloser, client, tlsPeer, info)
 }
 
-func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
+// viaPeer names the proxy in a log line when the client came through one.
+func viaPeer(info *ConnInfo) string {
+	if src := info.Source(); src != info.Peer {
+		return ", via=" + addrString(info.Peer)
+	}
+	return ""
+}
+
+func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string, info *ConnInfo) {
 	defer s.wait.Done()
 	conn, _ := readCloser.closer.(net.Conn)
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Recovered from panic reading connection, closing it, remote=%s, local=%s, error=%v\n%s",
-				append(connAddrs(conn), r, debug.Stack())...)
+				info.Source(), info.Local, r, debug.Stack())
 			if conn != nil {
 				s.untrackConn(conn)
 			}
 			readCloser.closer.Close()
-			if conn != nil {
-				s.connEvent(ConnClosed, conn, nil)
-			}
+			info.close(ClosePanic, fmt.Errorf("%v", r))
+			s.connEvent(ConnClosed, info, nil)
 		}
 	}()
 	frames := newFrameReader(readCloser.Reader, s.maxFrameSize)
+	frames.info = info
 	frames.logf = func(format string, args ...any) {
-		log.Printf(format+", remote=%s, local=%s", append(args, connAddrs(conn)...)...)
+		log.Printf(format+", remote=%s, local=%s", append(args, info.Source(), info.Local)...)
 	}
 	// Read until an error. Kill doesn't stop this loop directly: it sets a
 	// short read deadline, so what has already arrived is still delivered.
@@ -359,64 +386,50 @@ func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
 		}
 		msg, err := frames.next()
 		if len(msg) > 0 {
+			info.frame(msg)
 			s.parser(msg, client, tlsPeer)
 		}
 		// Stop reading on error
 		if err != nil {
+			reason := readCloseReason(err, s.isStopping())
 			if errors.Is(err, io.EOF) {
-				log.Println("EOF when reading token")
+				s.connLog("EOF when reading token")
+				err = nil
 			} else {
-				log.Printf("Error when reading token: %v", err)
+				s.connLog("Error when reading token: %v", err)
 			}
+			info.close(reason, err)
 			break
 		}
 	}
 	// Close connection
 	if conn != nil {
 		s.untrackConn(conn)
-		addrs := connAddrs(conn)
-		log.Printf("Closing connection, proto=%s, remote=%s, local=%s",
-			connNetwork(conn), addrs[0], addrs[1],
+		s.connLog("Closing connection, proto=%s, remote=%s, local=%s%s",
+			connNetwork(info), info.Source(), info.Local, viaPeer(info),
 		)
 	}
 	readCloser.closer.Close()
-	if conn != nil {
-		s.connEvent(ConnClosed, conn, nil)
-	}
+	s.connEvent(ConnClosed, info, nil)
 }
 
 // recoverConn turns a panic while setting up a connection (TLS handshake,
 // peer name) into a log line and a closed connection, instead of a crash of
 // the whole process and every other port with it.
-func (s *Server) recoverConn(conn net.Conn) {
+func (s *Server) recoverConn(conn net.Conn, info *ConnInfo) {
 	if r := recover(); r != nil {
 		log.Printf("Recovered from panic handling connection, closing it, remote=%s, local=%s, error=%v\n%s",
-			append(connAddrs(conn), r, debug.Stack())...)
+			info.Peer, info.Local, r, debug.Stack())
 		s.untrackConn(conn)
 		conn.Close()
-		s.connEvent(ConnClosed, conn, nil)
+		info.close(ClosePanic, fmt.Errorf("%v", r))
+		s.connEvent(ConnClosed, info, nil)
 	}
 }
 
-// connAddrs returns the remote and local address of conn, tolerating nil.
-func connAddrs(conn net.Conn) []any {
-	var remote, local any = "", ""
-	if conn != nil {
-		if a := conn.RemoteAddr(); a != nil {
-			remote = a
-		}
-		if a := conn.LocalAddr(); a != nil {
-			local = a
-		}
-	}
-	return []any{remote, local}
-}
-
-func connNetwork(conn net.Conn) string {
-	if conn != nil {
-		if a := conn.LocalAddr(); a != nil {
-			return a.Network()
-		}
+func connNetwork(info *ConnInfo) string {
+	if info.Local != nil {
+		return info.Local.Network()
 	}
 	return ""
 }
@@ -519,11 +532,7 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 	logParts := parser.Dump()
 	logParts["client"] = client
 	if logParts["hostname"] == "" && (used == RFC3164 || used == Automatic) {
-		if i := strings.Index(client, ":"); i > 1 {
-			logParts["hostname"] = client[:i]
-		} else {
-			logParts["hostname"] = client
-		}
+		logParts["hostname"] = clientHost(client)
 	}
 	logParts["tls_peer"] = tlsPeer
 
@@ -631,4 +640,14 @@ func (s *Server) goParseDatagrams() {
 			s.datagramPool.Put(&buf)
 		}
 	})
+}
+
+// clientHost is the host part of a client address ("10.0.0.1:5555",
+// "[2001:db8::1]:5555"), or the whole of it when it has no port (a unix
+// socket path).
+func clientHost(client string) string {
+	if host, _, err := net.SplitHostPort(client); err == nil {
+		return host
+	}
+	return client
 }

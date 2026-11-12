@@ -22,7 +22,7 @@ type eventLog struct {
 	errs   []error
 }
 
-func (l *eventLog) hook(ev ConnEvent, _ net.Conn, err error) {
+func (l *eventLog) hook(ev ConnEvent, _ *ConnInfo, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.events = append(l.events, ev)
@@ -123,7 +123,7 @@ func TestConnHookUntrustedServer(t *testing.T) {
 func TestConnHookPanicIsContained(t *testing.T) {
 	h := newCollectHandler()
 	server, addr := startTLSServer(t, RFC5424, h, func(s *Server) {
-		s.SetConnHook(func(ConnEvent, net.Conn, error) { panic("hook") })
+		s.SetConnHook(func(ConnEvent, *ConnInfo, error) { panic("hook") })
 	})
 	defer stop(t, server)
 
