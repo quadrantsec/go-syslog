@@ -1,0 +1,21 @@
+# Conservative on purpose: correctness checks, no style opinions. Modeled on
+# quadrantsec/runner-cloud's config.
+version: "2"
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - bodyclose      # HTTP response bodies are closed
+    - durationcheck  # no duration * duration
+    - errorlint      # wrapped errors compared with errors.Is/As, wrapped with %w
+    - misspell
+    - nilerr         # no `return nil` right after checking err != nil
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+
+formatters:
+  enable:
+    - gofmt

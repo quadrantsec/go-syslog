@@ -13,10 +13,15 @@ func main() {
 	server := syslog.NewServer()
 	server.SetFormat(syslog.RFC5424)
 	server.SetHandler(handler)
-	server.ListenUDP("0.0.0.0:514")
-	server.ListenTCP("0.0.0.0:514")
-
-	server.Boot()
+	if err := server.ListenUDP("0.0.0.0:514"); err != nil {
+		panic(err)
+	}
+	if err := server.ListenTCP("0.0.0.0:514"); err != nil {
+		panic(err)
+	}
+	if err := server.Boot(); err != nil {
+		panic(err)
+	}
 
 	go func(channel syslog.LogPartsChannel) {
 		for logParts := range channel {

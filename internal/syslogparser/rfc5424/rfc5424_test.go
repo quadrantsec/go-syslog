@@ -35,7 +35,7 @@ func (s *Rfc5424TestSuite) TestParser_Valid(c *C) {
 	c.Assert(err, IsNil)
 
 	expected := []syslogparser.LogParts{
-		syslogparser.LogParts{
+		{
 			"priority":        34,
 			"facility":        4,
 			"severity":        2,
@@ -48,7 +48,7 @@ func (s *Rfc5424TestSuite) TestParser_Valid(c *C) {
 			"structured_data": "-",
 			"message":         "'su root' failed for lonvick on /dev/pts/8",
 		},
-		syslogparser.LogParts{
+		{
 			"priority":        165,
 			"facility":        20,
 			"severity":        5,
@@ -61,7 +61,7 @@ func (s *Rfc5424TestSuite) TestParser_Valid(c *C) {
 			"structured_data": "-",
 			"message":         "%% It's time to make the do-nuts.",
 		},
-		syslogparser.LogParts{
+		{
 			"priority":        165,
 			"facility":        20,
 			"severity":        5,
@@ -74,7 +74,7 @@ func (s *Rfc5424TestSuite) TestParser_Valid(c *C) {
 			"structured_data": "-",
 			"message":         "%% It's time to make the do-nuts.",
 		},
-		syslogparser.LogParts{
+		{
 			"priority":        165,
 			"facility":        20,
 			"severity":        5,
@@ -87,7 +87,7 @@ func (s *Rfc5424TestSuite) TestParser_Valid(c *C) {
 			"structured_data": `[exampleSDID@32473 iut="3" eventSource="Application" eventID="1011"]`,
 			"message":         "An application event log entry...",
 		},
-		syslogparser.LogParts{
+		{
 			"priority":        165,
 			"facility":        20,
 			"severity":        5,
@@ -100,7 +100,7 @@ func (s *Rfc5424TestSuite) TestParser_Valid(c *C) {
 			"structured_data": `[exampleSDID@32473 iut="3" eventSource= "Application" eventID="1011"][examplePriority@32473 class="high"]`,
 			"message":         "",
 		},
-		syslogparser.LogParts{
+		{
 			"priority":        165,
 			"facility":        20,
 			"severity":        5,
@@ -141,7 +141,7 @@ func (s *Rfc5424TestSuite) TestParser_Truncated(c *C) {
 	msg := "<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 - - %% It's time to make the do-nuts."
 	for i := range msg {
 		p := NewParser([]byte(msg[:i]))
-		p.Parse()
+		_ = p.Parse() // must not panic; errors are expected
 	}
 }
 
@@ -178,7 +178,7 @@ func (s *Rfc5424TestSuite) TestParseHeader_Valid(c *C) {
 
 	expected := []header{
 		// HEADER complete
-		header{
+		{
 			priority:  pri,
 			version:   1,
 			timestamp: ts,
@@ -188,7 +188,7 @@ func (s *Rfc5424TestSuite) TestParseHeader_Valid(c *C) {
 			msgId:     msgId,
 		},
 		// TIMESTAMP as NILVALUE
-		header{
+		{
 			priority:  pri,
 			version:   1,
 			timestamp: *new(time.Time),
@@ -198,7 +198,7 @@ func (s *Rfc5424TestSuite) TestParseHeader_Valid(c *C) {
 			msgId:     msgId,
 		},
 		// HOSTNAME as NILVALUE
-		header{
+		{
 			priority:  pri,
 			version:   1,
 			timestamp: ts,
@@ -208,7 +208,7 @@ func (s *Rfc5424TestSuite) TestParseHeader_Valid(c *C) {
 			msgId:     msgId,
 		},
 		// APP-NAME as NILVALUE
-		header{
+		{
 			priority:  pri,
 			version:   1,
 			timestamp: ts,
@@ -218,7 +218,7 @@ func (s *Rfc5424TestSuite) TestParseHeader_Valid(c *C) {
 			msgId:     msgId,
 		},
 		// PROCID as NILVALUE
-		header{
+		{
 			priority:  pri,
 			version:   1,
 			timestamp: ts,
@@ -228,7 +228,7 @@ func (s *Rfc5424TestSuite) TestParseHeader_Valid(c *C) {
 			msgId:     msgId,
 		},
 		// MSGID as NILVALUE
-		header{
+		{
 			priority:  pri,
 			version:   1,
 			timestamp: ts,

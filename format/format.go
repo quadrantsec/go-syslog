@@ -7,7 +7,7 @@ import (
 	"gopkg.in/mcuadros/go-syslog.v2/internal/syslogparser"
 )
 
-type LogParts map[string]interface{}
+type LogParts map[string]any
 
 type LogParser interface {
 	Parse() error
