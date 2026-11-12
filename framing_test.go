@@ -140,14 +140,14 @@ func TestFramingSeparatorsBetweenNonTransparentFrames(t *testing.T) {
 		sampleLinux, sampleFTD, sampleSophos)
 }
 
-// Once a connection uses octet counting, it's read as octet-counted: a
-// frame that doesn't start with a length is treated as lost sync and
-// skipped. No sender mixes framings on one connection, and stopping at a
+// Once a connection has sent two octet frames in a row, it's read as
+// octet-counted: a frame that doesn't start with a length is treated as
+// lost sync and skipped. No sender mixes framings on one connection, and stopping at a
 // '<' would wait forever for a newline FortiGate never sends.
 func TestFramingOctetConnectionStaysOctet(t *testing.T) {
 	checkFrames(t,
-		octet(sampleFortiGate1)+sampleLinux+"\n"+octet(sampleFortiGate2),
-		sampleFortiGate1, sampleFortiGate2)
+		octet(sampleFortiGate1)+octet(sampleFortiGate1)+sampleLinux+"\n"+octet(sampleFortiGate2),
+		sampleFortiGate1, sampleFortiGate1, sampleFortiGate2)
 }
 
 // A sender that undercounts: the leftover bytes are skipped and the next
@@ -157,8 +157,8 @@ func TestFramingResyncAfterMiscount(t *testing.T) {
 	msg := `<189>1 2026-10-27T14:03:13-05:00 FGT-EDGE-01 - - - - logid="0000000020" action="close" msg="done"`
 	bad := fmt.Sprintf("%d %s", len(msg)-7, msg)
 	checkFrames(t,
-		bad+octet(sampleFortiGate2)+octet(sampleFortiGate1),
-		msg[:len(msg)-7], sampleFortiGate2, sampleFortiGate1)
+		octet(sampleFortiGate1)+octet(sampleFortiGate2)+bad+octet(sampleFortiGate2)+octet(sampleFortiGate1),
+		sampleFortiGate1, sampleFortiGate2, msg[:len(msg)-7], sampleFortiGate2, sampleFortiGate1)
 }
 
 // The leftover contains a '<'. Resync must not stop there and read to a
@@ -167,10 +167,8 @@ func TestFramingResyncSkipsBareBracket(t *testing.T) {
 	msg := `<189>1 2026-10-27T14:03:14-05:00 FGT-EDGE-01 - - - - logid="0102043008" user="<admin>" action="login"`
 	cut := strings.Index(msg, `"<admin>`)
 	bad := fmt.Sprintf("%d %s", cut, msg)
-	var input string
-	var want []string
-	want = append(want, msg[:cut])
-	input = bad
+	input := octet(sampleFortiGate1) + octet(sampleFortiGate2) + bad
+	want := []string{sampleFortiGate1, sampleFortiGate2, msg[:cut]}
 	for range 50 {
 		input += octet(sampleFortiGate2)
 		want = append(want, sampleFortiGate2)
@@ -194,15 +192,101 @@ func TestFramingResyncGluedDigitsOverCap(t *testing.T) {
 	}
 }
 
-// A connection that closes mid-frame returns what arrived and the error.
+// A frame cut short by the connection closing is incomplete: it isn't
+// delivered as a message.
 func TestFramingPartialOctetFrame(t *testing.T) {
 	got, err := readAll(t, strings.NewReader(octet(sampleFortiGate1)[:40]), 0)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("want io.ErrUnexpectedEOF, got %v", err)
 	}
-	if len(got) != 1 || !strings.HasPrefix(sampleFortiGate1, got[0]) {
-		t.Fatalf("want the partial frame, got %q", got)
+	if len(got) != 0 {
+		t.Fatalf("want no message, got %q", got)
 	}
+}
+
+// errReader returns its data, then err.
+type errReader struct {
+	data string
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.data == "" {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+var errTimeout = errors.New("i/o timeout")
+
+// A message cut short by a timeout, reset or Kill isn't delivered, for
+// either framing. At EOF the last unterminated message still is.
+func TestFramingPartialOnErrorDropped(t *testing.T) {
+	for name, input := range map[string]string{
+		"octet":           octet(sampleFortiGate1) + octet(sampleFortiGate2)[:40],
+		"non-transparent": sampleLinux + "\n" + sampleFTD[:40],
+	} {
+		got, err := readAll(t, &errReader{input, errTimeout}, 0)
+		if !errors.Is(err, errTimeout) {
+			t.Errorf("%s: want the timeout, got %v", name, err)
+		}
+		if len(got) != 1 {
+			t.Errorf("%s: want only the complete message, got %d: %q", name, len(got), got)
+		}
+	}
+}
+
+// A line on a newline connection that looks like "5 <..." is read as one
+// octet frame, but doesn't switch the connection to octet counting: the
+// lines after it are still split on LF.
+func TestFramingFalseOctetHeaderOnNewlineConnection(t *testing.T) {
+	input := "<13>first\n" + "5 <x>yz\n"
+	want := []string{"<13>first", "<x>yz"}
+	for range 20 {
+		input += sampleLinux + "\n"
+		want = append(want, sampleLinux)
+	}
+	checkFrames(t, input, want...)
+}
+
+// An over-cap length on an octet-counted connection that no shorter suffix
+// verifies (the next frame hasn't arrived yet) is skipped with a resync,
+// not trusted: trusting it discarded megabytes of good frames.
+func TestFramingOverCapUnverifiedResyncs(t *testing.T) {
+	msg := `<189>1 2026-10-27T14:03:15-05:00 FGT-EDGE-01 - - - - logid="0000000013" sentbyte=13107`
+	glued := fmt.Sprintf("%d %s", len(msg)-5, msg) // leaves "13107" glued onto the next length
+	next := octet(sampleFortiGate2)
+	first := octet(sampleFortiGate1) + octet(sampleFortiGate1) + glued + next
+	var later strings.Builder
+	for range 400 {
+		later.WriteString(octet(sampleFortiGate1))
+	}
+	// Separate reads, so the frame after the glued length isn't buffered
+	// when the length is checked.
+	r := io.MultiReader(strings.NewReader(first), strings.NewReader(later.String()))
+	got, err := readAll(t, r, 1<<20)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("want io.EOF, got %v", err)
+	}
+	// The glued frame is lost; everything after it is delivered.
+	if len(got) < 403 {
+		t.Fatalf("delivered %d messages, want at least 403", len(got))
+	}
+	for i, m := range got[len(got)-400:] {
+		if m != sampleFortiGate1 {
+			t.Fatalf("message %d after the resync is %q", i, m)
+		}
+	}
+}
+
+// A NUL inside a line is content, not a trailer; Sophos's NUL after each
+// message still is.
+func TestFramingEmbeddedNUL(t *testing.T) {
+	checkFrames(t,
+		"<13>abc\x00def\n"+sampleSophos+"\x00"+sampleSophos+"\x00",
+		"<13>abc\x00def", sampleSophos, sampleSophos)
 }
 
 type repeatReader byte
@@ -284,12 +368,17 @@ func TestFramingOversizedUnterminated(t *testing.T) {
 
 func TestIndexTrailer(t *testing.T) {
 	for in, want := range map[string]int{
-		"":           -1,
-		"abc":        -1,
-		"ab\ncd\x00": 2,
-		"ab\x00cd\n": 2,
-		"\n":         0,
-		"\x00":       0,
+		"":              -1,
+		"abc":           -1,
+		"ab\ncd\x00":    2,
+		"ab\x00cd\n":    5,
+		"ab\x00<1>":     2,
+		"ab\x00":        2,
+		"ab\x00\r\n":    2,
+		"ab\x00\x00":    2,
+		"\n":            0,
+		"\x00":          0,
+		"a\x00b\x00<1>": 3,
 	} {
 		if got := indexTrailer([]byte(in)); got != want {
 			t.Errorf("indexTrailer(%q) = %d, want %d", in, got, want)

@@ -3,6 +3,7 @@ package syslog
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
 )
 
@@ -31,11 +32,13 @@ const (
 type frameReader struct {
 	r   *bufio.Reader
 	max int
-	// counted is true when the previous frame used octet counting. An
-	// unrecognized frame start on such a connection means we lost sync
-	// (for example the sender miscounted), so we skip to the next frame
-	// instead of reading to a newline the sender may never send.
-	counted bool
+	// streak counts octet-counted frames in a row (capped at 2). Two in a
+	// row settle the connection as octet-counted: from then on, a frame
+	// start that isn't a length means we lost sync (the sender miscounted),
+	// so we skip to the next length instead of reading to a newline the
+	// sender may never send. One frame isn't enough: a line on a newline
+	// connection can look like "123 <...".
+	streak int
 	// logf reports dropped or skipped data. It may be nil.
 	logf func(format string, args ...any)
 	// scratch accumulates a non-transparent frame across buffer refills,
@@ -74,48 +77,58 @@ func (f *frameReader) next() ([]byte, error) {
 	}
 
 	if n, hdr, ok := f.peekOctetCount(); ok {
-		f.counted = true
-		return f.readCountedAt(n, hdr)
+		if n > f.max {
+			// A length this big is usually the leftover digits of a
+			// miscounted frame glued onto the real length ("21" + "297 <").
+			// Use a shorter suffix of the digits if it lands exactly on the
+			// next frame.
+			if skip, sn, ok := f.suffixCount(hdr - 1); ok {
+				f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", skip)
+				_, _ = f.r.Discard(skip)
+				hdr -= skip
+				n = sn
+			} else if f.counted() {
+				// On a connection that has been sending small octet
+				// frames, nothing verifies a shorter length. Trusting this
+				// one would discard n bytes of what are probably good
+				// frames, so drop the header and resync on the next call.
+				f.log("Skipped implausible octet count on octet-counted connection, length=%d, max_bytes=%d", n, f.max)
+				_, _ = f.r.Discard(hdr)
+				return nil, nil
+			}
+			// Otherwise (a fresh connection, where nothing can have been
+			// miscounted yet) it's an oversized frame: readCounted drops it.
+		}
+		if f.streak < 2 {
+			f.streak++
+		}
+		_, _ = f.r.Discard(hdr)
+		return f.readCounted(n)
 	}
 
-	if f.counted {
+	if f.counted() {
 		// Not a frame start on an octet-counted connection: we lost sync.
-		// Skip to the next octet count. Never stop at a bare '<' (it may be
-		// inside the leftover text), because reading to a newline would
-		// wait forever on a sender like FortiGate that never sends one.
+		// Skip to the next octet count, then read it on the next call.
+		// Never stop at a bare '<' (it may be inside the leftover text),
+		// because reading to a newline would wait forever on a sender like
+		// FortiGate that never sends one.
 		found, err := f.resync()
 		if err != nil {
 			return nil, err
 		}
 		if found {
-			n, hdr, _ := f.peekOctetCount()
-			return f.readCountedAt(n, hdr)
+			return nil, nil
 		}
 		// No octet count within a frame's worth of data: treat the
 		// connection as non-transparent from here on.
-		f.counted = false
 	}
+	f.streak = 0
 	return f.readToTrailer()
 }
 
-// readCountedAt reads the octet-counted frame whose "MSG-LEN SP" header of
-// hdr bytes is at the reader position.
-func (f *frameReader) readCountedAt(n, hdr int) ([]byte, error) {
-	if n > f.max {
-		// A length this big is usually the leftover digits of a miscounted
-		// frame glued onto the real length (e.g. "21" + "297 <"). If a
-		// shorter suffix of the digits lands exactly on the next frame,
-		// skip the leftover digits and use it, instead of discarding
-		// megabytes of good frames.
-		if skip, sn, ok := f.suffixCount(hdr - 1); ok {
-			f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", skip)
-			_, _ = f.r.Discard(skip)
-			hdr -= skip
-			n = sn
-		}
-	}
-	_, _ = f.r.Discard(hdr)
-	return f.readCounted(n)
+// counted reports whether the connection has settled on octet counting.
+func (f *frameReader) counted() bool {
+	return f.streak >= 2
 }
 
 // suffixCount looks for a shorter suffix of the digits digits at the reader
@@ -201,15 +214,18 @@ func (f *frameReader) peekOctetCount() (n int, hdr int, ok bool) {
 func (f *frameReader) readCounted(n int) ([]byte, error) {
 	if n > f.max {
 		// Drop it without buffering it, and carry on at the next frame.
-		discarded, err := f.r.Discard(n)
-		f.log("Dropped oversized syslog frame, size_bytes=%d, max_bytes=%d, discarded_bytes=%d",
-			n, f.max, discarded)
+		f.log("Dropping oversized syslog frame, size_bytes=%d, max_bytes=%d", n, f.max)
+		_, err := f.r.Discard(n)
 		return nil, err
 	}
 	msg := make([]byte, n)
-	read, err := io.ReadFull(f.r, msg)
+	if _, err := io.ReadFull(f.r, msg); err != nil {
+		// Cut short (closed, reset or timed out mid-frame): it's
+		// incomplete, so don't deliver it as a message.
+		return nil, err
+	}
 	// Some senders count a trailing newline (or NUL) as part of the message.
-	return bytes.TrimRight(msg[:read], "\r\n\x00"), err
+	return bytes.TrimRight(msg, "\r\n\x00"), nil
 }
 
 // readToTrailer reads a non-transparent-framed message up to LF or NUL, or
@@ -226,7 +242,13 @@ func (f *frameReader) readToTrailer() ([]byte, error) {
 	for {
 		if f.r.Buffered() == 0 {
 			if _, err := f.r.Peek(1); err != nil {
-				return f.finishTrailer(msg, dropped), err
+				// At EOF the sender closed after its last message, which
+				// may have no trailer: deliver it. Any other error (reset,
+				// timeout, Kill) cut the message short: drop it.
+				if errors.Is(err, io.EOF) {
+					return f.finishTrailer(msg, dropped), err
+				}
+				return nil, err
 			}
 		}
 		chunk, _ := f.r.Peek(f.r.Buffered())
@@ -289,12 +311,30 @@ func isFrameSpace(c byte) bool {
 	return c == '\n' || c == '\r' || c == ' ' || c == '\t' || c == 0
 }
 
-// indexTrailer returns the index of the first LF or NUL in b, or -1.
+// indexTrailer returns the index of the first trailer in b, or -1. A trailer
+// is an LF, or a NUL that ends a message: one followed by '<', CR, LF,
+// another NUL, or nothing yet (Sophos ends each message with a NUL). A NUL
+// followed by other text is inside a message and is kept.
 func indexTrailer(b []byte) int {
 	lf := bytes.IndexByte(b, '\n')
-	nul := bytes.IndexByte(b, 0)
-	if lf < 0 || (nul >= 0 && nul < lf) {
-		return nul
+	limit := len(b)
+	if lf >= 0 {
+		limit = lf
+	}
+	for i := 0; i < limit; {
+		j := bytes.IndexByte(b[i:limit], 0)
+		if j < 0 {
+			break
+		}
+		j += i
+		if j+1 >= len(b) {
+			return j
+		}
+		switch b[j+1] {
+		case '<', '\r', '\n', 0:
+			return j
+		}
+		i = j + 1
 	}
 	return lf
 }
