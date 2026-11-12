@@ -30,6 +30,10 @@ const (
 	DefaultHandshakeTimeout = 10 * time.Second
 
 	maxAcceptBackoff = time.Second
+
+	// killDrainTimeout is how long Kill lets open connections deliver what
+	// has already arrived before they're closed.
+	killDrainTimeout = time.Second
 )
 
 // A function type which gets the TLS peer name from the connection. Can return
@@ -274,10 +278,10 @@ func (s *Server) goReadConnection(connection net.Conn) {
 		// Handshake now so we get the TLS peer information. Bound it, then
 		// clear the deadline so the syslog read gets the read timeout.
 		if s.handshakeTimeout > 0 {
-			_ = tlsConn.SetDeadline(time.Now().Add(s.handshakeTimeout))
+			s.armDeadline(func() { _ = tlsConn.SetDeadline(time.Now().Add(s.handshakeTimeout)) })
 		}
 		err := tlsConn.Handshake()
-		_ = tlsConn.SetDeadline(time.Time{})
+		s.armDeadline(func() { _ = tlsConn.SetDeadline(time.Time{}) })
 		if err != nil {
 			log.Printf("Failed to complete TLS handshake, closing connection, "+
 				"remote=%s, local=%s, error=%v",
@@ -317,9 +321,13 @@ func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string) {
 	frames.logf = func(format string, args ...any) {
 		log.Printf(format+", remote=%s, local=%s", append(args, connAddrs(conn)...)...)
 	}
-	for !s.isStopping() {
+	// Read until an error. Kill doesn't stop this loop directly: it sets a
+	// short read deadline, so what has already arrived is still delivered.
+	for {
 		if s.readTimeoutMilliseconds > 0 {
-			_ = readCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
+			s.armDeadline(func() {
+				_ = readCloser.closer.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeoutMilliseconds) * time.Millisecond))
+			})
 		}
 		msg, err := frames.next()
 		if len(msg) > 0 {
@@ -396,10 +404,34 @@ func (s *Server) isStopping() bool {
 	return s.stopping
 }
 
-// closeConns marks the server as stopping and closes every open connection.
-func (s *Server) closeConns() {
+// armDeadline runs set (which changes a connection's deadline) unless the
+// server is stopping. Under the lock, so it can't override the drain
+// deadline stopConns sets.
+func (s *Server) armDeadline(set func()) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if !s.stopping {
+		set()
+	}
+}
+
+// stopConns marks the server as stopping and gives every open connection
+// killDrainTimeout to deliver what has already arrived, then closes the
+// ones still open.
+func (s *Server) stopConns() {
 	s.connsMu.Lock()
 	s.stopping = true
+	drain := time.Now().Add(killDrainTimeout)
+	for conn := range s.conns {
+		_ = conn.SetReadDeadline(drain)
+	}
+	s.connsMu.Unlock()
+	time.AfterFunc(2*killDrainTimeout, s.closeConns)
+}
+
+// closeConns closes every connection still open.
+func (s *Server) closeConns() {
+	s.connsMu.Lock()
 	conns := make([]net.Conn, 0, len(s.conns))
 	for conn := range s.conns {
 		conns = append(conns, conn)
@@ -467,7 +499,7 @@ func (s *Server) Kill() error {
 	s.killOnce.Do(func() {
 		// Mark stopping first, so a connection accepted while the
 		// listeners close is refused instead of left open.
-		s.closeConns()
+		s.stopConns()
 		for _, connection := range s.connections {
 			if err := connection.Close(); err != nil && firstErr == nil {
 				firstErr = err

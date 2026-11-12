@@ -74,24 +74,89 @@ func (f *frameReader) next() ([]byte, error) {
 	}
 
 	if n, hdr, ok := f.peekOctetCount(); ok {
-		_, _ = f.r.Discard(hdr)
 		f.counted = true
-		return f.readCounted(n)
+		return f.readCountedAt(n, hdr)
 	}
 
-	b, _ := f.r.Peek(1)
-	if b[0] != '<' && f.counted {
-		if err := f.resync(); err != nil {
+	if f.counted {
+		// Not a frame start on an octet-counted connection: we lost sync.
+		// Skip to the next octet count. Never stop at a bare '<' (it may be
+		// inside the leftover text), because reading to a newline would
+		// wait forever on a sender like FortiGate that never sends one.
+		found, err := f.resync()
+		if err != nil {
 			return nil, err
 		}
-		// resync stops at a '<' or a valid octet count.
-		if n, hdr, ok := f.peekOctetCount(); ok {
-			_, _ = f.r.Discard(hdr)
-			return f.readCounted(n)
+		if found {
+			n, hdr, _ := f.peekOctetCount()
+			return f.readCountedAt(n, hdr)
+		}
+		// No octet count within a frame's worth of data: treat the
+		// connection as non-transparent from here on.
+		f.counted = false
+	}
+	return f.readToTrailer()
+}
+
+// readCountedAt reads the octet-counted frame whose "MSG-LEN SP" header of
+// hdr bytes is at the reader position.
+func (f *frameReader) readCountedAt(n, hdr int) ([]byte, error) {
+	if n > f.max {
+		// A length this big is usually the leftover digits of a miscounted
+		// frame glued onto the real length (e.g. "21" + "297 <"). If a
+		// shorter suffix of the digits lands exactly on the next frame,
+		// skip the leftover digits and use it, instead of discarding
+		// megabytes of good frames.
+		if skip, sn, ok := f.suffixCount(hdr - 1); ok {
+			f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", skip)
+			_, _ = f.r.Discard(skip)
+			hdr -= skip
+			n = sn
 		}
 	}
-	f.counted = false
-	return f.readToTrailer()
+	_, _ = f.r.Discard(hdr)
+	return f.readCounted(n)
+}
+
+// suffixCount looks for a shorter suffix of the digits digits at the reader
+// position that is a length ending exactly where the next frame starts,
+// within what's already buffered. It returns how many leading digits to skip
+// and the length.
+func (f *frameReader) suffixCount(digits int) (skip, n int, ok bool) {
+	b, err := f.r.Peek(f.r.Buffered())
+	if err != nil || len(b) <= digits {
+		return 0, 0, false
+	}
+	for skip = 1; skip < digits; skip++ {
+		if b[skip] == '0' {
+			continue // MSG-LEN has no leading zero
+		}
+		n = 0
+		for _, c := range b[skip:digits] {
+			n = n*10 + int(c-'0')
+		}
+		if n > f.max {
+			continue
+		}
+		if end := digits + 1 + n; end < len(b) && isFrameStart(b[end:]) {
+			return skip, n, true
+		}
+	}
+	return 0, 0, false
+}
+
+// isFrameStart reports whether b starts (after any whitespace or NULs) with
+// "MSG-LEN SP <". It needs the header to be in b.
+func isFrameStart(b []byte) bool {
+	i := 0
+	for i < len(b) && isFrameSpace(b[i]) {
+		i++
+	}
+	j := i
+	for j < len(b) && j-i < maxOctetCountDigits && b[j] >= '0' && b[j] <= '9' {
+		j++
+	}
+	return j > i && b[i] != '0' && j+1 < len(b) && b[j] == ' ' && b[j+1] == '<'
 }
 
 // peekOctetCount reports whether the reader is at "MSG-LEN SP <". It returns
@@ -199,28 +264,25 @@ func (f *frameReader) finishTrailer(msg []byte, dropped int) []byte {
 	return bytes.Clone(msg)
 }
 
-// resync skips bytes until the reader is at a '<' or at a valid octet count.
-func (f *frameReader) resync() error {
+// resync skips bytes until the reader is at a valid octet count, and
+// reports whether it found one. It gives up after a frame's worth of bytes.
+func (f *frameReader) resync() (bool, error) {
 	skipped := 0
 	defer func() {
 		if skipped > 0 {
 			f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", skipped)
 		}
 	}()
-	for {
-		b, err := f.r.Peek(1)
-		if err != nil {
-			return err
-		}
-		if b[0] == '<' {
-			return nil
-		}
+	for skipped < f.max {
 		if _, _, ok := f.peekOctetCount(); ok {
-			return nil
+			return true, nil
 		}
-		_, _ = f.r.Discard(1)
+		if _, err := f.r.Discard(1); err != nil {
+			return false, err
+		}
 		skipped++
 	}
+	return false, nil
 }
 
 func isFrameSpace(c byte) bool {

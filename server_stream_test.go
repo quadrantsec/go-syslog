@@ -243,3 +243,32 @@ type errHandler struct {
 func (h *errHandler) Handle(lp format.LogParts, _ int64, err error) {
 	h.parts, h.err = lp, err
 }
+
+// Kill lets open connections deliver frames that already arrived, instead
+// of dropping them with the socket.
+func TestKillDeliversWhatArrived(t *testing.T) {
+	h := newCollectHandler()
+	h.ch = make(chan format.LogParts, 1000)
+	server, addr := startTLSServer(t, RFC5424, h)
+
+	conn, err := tls.Dial("tcp", addr, getClientConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var stream string
+	for range 500 {
+		stream += octet(sampleFortiGate1)
+	}
+	if _, err := io.WriteString(conn, stream); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	stop(t, server)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.parts) != 500 {
+		t.Errorf("delivered %d of 500 frames that arrived before Kill", len(h.parts))
+	}
+}

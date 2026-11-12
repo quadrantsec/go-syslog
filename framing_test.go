@@ -128,23 +128,70 @@ func TestFramingDigitsWithoutOctetHeader(t *testing.T) {
 }
 
 // Whitespace and NULs between frames are skipped.
-func TestFramingMixedSeparators(t *testing.T) {
+func TestFramingSeparatorsBetweenOctetFrames(t *testing.T) {
 	checkFrames(t,
-		"\r\n \x00"+octet(sampleFortiGate1)+"\n\n"+sampleLinux+"\x00\n"+octet(sampleFortiGate2),
+		"\r\n \x00"+octet(sampleFortiGate1)+"\n\n"+octet(sampleLinux)+"\x00\n"+octet(sampleFortiGate2),
 		sampleFortiGate1, sampleLinux, sampleFortiGate2)
+}
+
+func TestFramingSeparatorsBetweenNonTransparentFrames(t *testing.T) {
+	checkFrames(t,
+		"\r\n \x00"+sampleLinux+"\n\n"+sampleFTD+"\x00\n"+sampleSophos+"\x00",
+		sampleLinux, sampleFTD, sampleSophos)
+}
+
+// Once a connection uses octet counting, it's read as octet-counted: a
+// frame that doesn't start with a length is treated as lost sync and
+// skipped. No sender mixes framings on one connection, and stopping at a
+// '<' would wait forever for a newline FortiGate never sends.
+func TestFramingOctetConnectionStaysOctet(t *testing.T) {
+	checkFrames(t,
+		octet(sampleFortiGate1)+sampleLinux+"\n"+octet(sampleFortiGate2),
+		sampleFortiGate1, sampleFortiGate2)
 }
 
 // A sender that undercounts: the leftover bytes are skipped and the next
 // octet-counted frame is read normally, instead of reading to a newline a
-// FortiGate never sends. (If the leftover ends in digits, they run into the
-// next frame's length and no reader can tell; senders count correctly in
-// practice, so this only limits the damage.)
+// FortiGate never sends.
 func TestFramingResyncAfterMiscount(t *testing.T) {
 	msg := `<189>1 2026-10-27T14:03:13-05:00 FGT-EDGE-01 - - - - logid="0000000020" action="close" msg="done"`
 	bad := fmt.Sprintf("%d %s", len(msg)-7, msg)
 	checkFrames(t,
 		bad+octet(sampleFortiGate2)+octet(sampleFortiGate1),
 		msg[:len(msg)-7], sampleFortiGate2, sampleFortiGate1)
+}
+
+// The leftover contains a '<'. Resync must not stop there and read to a
+// newline: FortiGate never sends one, so nothing more would be delivered.
+func TestFramingResyncSkipsBareBracket(t *testing.T) {
+	msg := `<189>1 2026-10-27T14:03:14-05:00 FGT-EDGE-01 - - - - logid="0102043008" user="<admin>" action="login"`
+	cut := strings.Index(msg, `"<admin>`)
+	bad := fmt.Sprintf("%d %s", cut, msg)
+	var input string
+	var want []string
+	want = append(want, msg[:cut])
+	input = bad
+	for range 50 {
+		input += octet(sampleFortiGate2)
+		want = append(want, sampleFortiGate2)
+	}
+	checkFrames(t, input, want...)
+}
+
+// The leftover ends in digits that run into the next length and make it
+// absurd ("8443" + "297 <"). The real length is recovered from the digits
+// instead of discarding megabytes of good frames.
+func TestFramingResyncGluedDigitsOverCap(t *testing.T) {
+	msg := `<189>1 2026-10-27T14:03:15-05:00 FGT-EDGE-01 - - - - logid="0000000013" sentbyte=8443`
+	bad := fmt.Sprintf("%d %s", len(msg)-4, msg) // leaves "8443"
+	got, err := readAll(t, strings.NewReader(bad+octet(sampleFortiGate2)+octet(sampleFortiGate1)), 1<<20)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("want io.EOF, got %v", err)
+	}
+	want := []string{msg[:len(msg)-4], sampleFortiGate2, sampleFortiGate1}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q\nwant %q", got, want)
+	}
 }
 
 // A connection that closes mid-frame returns what arrived and the error.
