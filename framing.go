@@ -47,6 +47,9 @@ type frameReader struct {
 	// scratch accumulates a non-transparent frame across buffer refills,
 	// so a long message is copied once instead of regrown.
 	scratch []byte
+	// recovered: recoverAfterCounted skipped to an octet count it found
+	// mid-data. The frame there doesn't advance the streak.
+	recovered bool
 }
 
 func newFrameReader(r *bufio.Reader, max int) *frameReader {
@@ -67,6 +70,8 @@ func (f *frameReader) log(format string, args ...any) {
 // before EOF); callers should use the message and then stop on the error. An
 // empty message with a nil error means a frame was dropped; call next again.
 func (f *frameReader) next() ([]byte, error) {
+	recovered := f.recovered
+	f.recovered = false
 	// Skip whitespace and NULs between frames.
 	for {
 		b, err := f.r.Peek(1)
@@ -105,7 +110,7 @@ func (f *frameReader) next() ([]byte, error) {
 			// Otherwise (the first frame, where nothing can have been
 			// miscounted yet) it's an oversized frame: readCounted drops it.
 		}
-		if f.streak < 2 {
+		if f.streak < 2 && !recovered {
 			f.streak++
 		}
 		_, _ = f.r.Discard(hdr)
@@ -159,6 +164,7 @@ func (f *frameReader) recoverAfterCounted() ([]byte, error) {
 			if len(msg) > 0 {
 				f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", len(msg))
 				f.info.dropped(len(msg), 0)
+				f.recovered = true
 			}
 			return nil, nil
 		}
@@ -185,11 +191,10 @@ func (f *frameReader) recoverAfterCounted() ([]byte, error) {
 		}
 		msg = append(msg, c)
 	}
-	// A frame's worth with neither: drop it and read on as non-transparent.
-	f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", len(msg))
-	f.info.dropped(len(msg), 0)
+	// A frame's worth with neither: read on as non-transparent, keeping
+	// what's read as the head of the message.
 	f.streak = 0
-	return nil, nil
+	return f.readToTrailerFrom(msg)
 }
 
 // nulEndsFrame reports whether a NUL just read ends a frame: when the next
@@ -298,14 +303,15 @@ func (f *frameReader) readCounted(n int) ([]byte, error) {
 	if n > f.max {
 		// Drop it without buffering it, and carry on at the next frame.
 		f.log("Dropping oversized syslog frame, size_bytes=%d, max_bytes=%d", n, f.max)
-		f.info.dropped(n, 1)
-		_, err := f.r.Discard(n)
+		d, err := f.r.Discard(n)
+		f.info.dropped(d, 1) // what was there: the stream may end first
 		return nil, err
 	}
 	msg := make([]byte, n)
-	if _, err := io.ReadFull(f.r, msg); err != nil {
+	if k, err := io.ReadFull(f.r, msg); err != nil {
 		// Cut short (closed, reset or timed out mid-frame): it's
 		// incomplete, so don't deliver it as a message.
+		f.info.dropped(k, 1)
 		return nil, err
 	}
 	// Some senders count a trailing newline (or NUL) as part of the message.
@@ -315,7 +321,10 @@ func (f *frameReader) readCounted(n int) ([]byte, error) {
 // readToTrailer reads a non-transparent-framed message up to LF or NUL, or
 // up to EOF. Bytes beyond the cap are dropped up to the trailer.
 func (f *frameReader) readToTrailer() ([]byte, error) {
-	msg := f.scratch[:0]
+	return f.readToTrailerFrom(f.scratch[:0])
+}
+
+func (f *frameReader) readToTrailerFrom(msg []byte) ([]byte, error) {
 	defer func() {
 		// Keep the grown buffer for the next frame, unless it's huge.
 		if cap(msg) <= 64<<10 {

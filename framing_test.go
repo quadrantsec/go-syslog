@@ -420,8 +420,10 @@ func TestUndercountedFirstFrameOctetOnly(t *testing.T) {
 	for i := 1; i <= 50; i++ {
 		input += octet(msgAt(i))
 	}
-	got, err := readAll(t, strings.NewReader(input), 0)
-	if !errors.Is(err, io.EOF) {
+	// The sender then goes quiet until the idle timeout, as FortiGate
+	// does between bursts: everything before it must be out by then.
+	got, err := readAll(t, &errReader{input, errTimeout}, 0)
+	if !errors.Is(err, errTimeout) {
 		t.Fatalf("err = %v", err)
 	}
 	if len(got) != 51 || got[0] != first[:len(first)-7] || got[50] != msgAt(50) {
@@ -462,8 +464,9 @@ func TestGluedLengthAfterFirstFrameSlowSender(t *testing.T) {
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("err = %v", err)
 	}
-	if len(got) < 299 || got[len(got)-1] != msgAt(300) {
-		t.Fatalf("delivered %d of 301", len(got))
+	// Only the frame whose length was glued is lost.
+	if len(got) != 300 || got[0] != first[:len(first)-5] || got[1] != msgAt(2) || got[299] != msgAt(300) {
+		t.Fatalf("delivered %d of 301, want all but the 2nd", len(got))
 	}
 }
 
@@ -495,4 +498,105 @@ func (c *oneChunkReader) Read(p []byte) (int, error) {
 		c.chunks = c.chunks[1:]
 	}
 	return n, nil
+}
+
+// While recovering, an octet count can turn up mid-line on a line sender
+// ("3 <b@...", "5.1.1 <user@..."). Reading it as a frame used to settle the
+// connection on octet counting, and resync then discarded up to a frame's
+// worth at a time, for the rest of the connection.
+func TestLineSenderLookalikeInLeftover(t *testing.T) {
+	for name, tc := range map[string]struct {
+		input, line string
+		n           int
+	}{
+		"first line": {"2 <a@example.com> 3 <b@example.com> bounced\n", sampleLinux, 500},
+		"mid-connection": {strings.Repeat(sampleLinux+"\n", 10) +
+			"  1 <postmaster@example.com>: 550 5.1.1 <user@example.com> rejected\n", sampleFTD, 300},
+	} {
+		got, err := readAll(t, strings.NewReader(tc.input+strings.Repeat(tc.line+"\n", tc.n)), 0)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+		n := 0
+		for _, m := range got {
+			if m == tc.line {
+				n++
+			}
+		}
+		if n != tc.n {
+			t.Errorf("%s: delivered %d of the %d lines after the counted-looking one", name, n, tc.n)
+		}
+	}
+}
+
+// The leftover of a line sender's counted-looking first line ends at an LF,
+// a NUL that ends a frame, or EOF, and is delivered; a NUL followed by more
+// text is part of the message.
+func TestLeftoverTrailers(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"12 <13>hello world\x00<13>two\x00", []string{"<13>hello wo", "rld", "<13>two"}},
+		{"12 <13>hello wor\x00ld\n<13>two\n", []string{"<13>hello wo", "r\x00ld", "<13>two"}},
+		{"12 <13>hello world\r\n<13>two\r\n", []string{"<13>hello wo", "rld", "<13>two"}},
+		{"12 <13>hello world", []string{"<13>hello wo", "rld"}},
+	} {
+		got, err := readAll(t, strings.NewReader(tc.in), 0)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("%q: err = %v", tc.in, err)
+		}
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("%q: got %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A leftover longer than the cap is the head of an oversized line: it's
+// delivered truncated, as any long line is, not dropped with the tail
+// delivered as a message of its own.
+func TestLongLeftoverKeepsHead(t *testing.T) {
+	long := "<13>1 - - - - - - " + strings.Repeat("x", 200)
+	got, err := readAll(t, strings.NewReader(octet(long)+long+"\n<13>next\n"), 100)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	// The counted copy is over the cap and dropped whole; the line after it
+	// is the leftover, and keeps its head.
+	want := []string{long[:100], "<13>next"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Exactly the cap, then EOF: all of it is delivered.
+	got, _ = readAll(t, strings.NewReader("1 <"+strings.Repeat("A", 100)), 100)
+	if len(got) != 2 || got[1] != strings.Repeat("A", 100) {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Data lost to a read error (a timeout, reset or Kill) mid-message is
+// counted, whichever way the message was framed.
+func TestErrorPathAccounting(t *testing.T) {
+	hdr := fmt.Sprintf("%d ", len(sampleFortiGate2))
+	for name, tc := range map[string]struct {
+		in            string
+		bytes, frames int64
+	}{
+		"leftover":  {octet(sampleFortiGate1) + "leftover-no-trailer", int64(len("leftover-no-trailer")), 1},
+		"line":      {sampleLinux + "\n" + "partial", int64(len("partial")), 1},
+		"octet":     {octet(sampleFortiGate1) + octet(sampleFortiGate2)[:40], int64(40 - len(hdr)), 1},
+		"oversized": {"99999999 <13>x", int64(len("<13>x")), 1},
+	} {
+		info := &ConnInfo{}
+		fr := newFrameReader(bufio.NewReader(&errReader{tc.in, errTimeout}), 0)
+		fr.info = info
+		for range 100 {
+			if _, err := fr.next(); err != nil {
+				break
+			}
+		}
+		if s := info.Snapshot(); s.DroppedBytes != tc.bytes || s.DroppedFrames != tc.frames {
+			t.Errorf("%s: dropped %d bytes, %d frames; want %d, %d", name, s.DroppedBytes, s.DroppedFrames, tc.bytes, tc.frames)
+		}
+	}
 }
