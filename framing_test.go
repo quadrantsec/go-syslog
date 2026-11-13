@@ -600,3 +600,31 @@ func TestErrorPathAccounting(t *testing.T) {
 		}
 	}
 }
+
+// A leftover of exactly the cap that ends at an octet count is dropped, and
+// the frames after it are read: it isn't the head of a long line.
+func TestLeftoverOfExactlyCapBeforeFrame(t *testing.T) {
+	input := "5 <13>a" + strings.Repeat("b", 100)
+	for i := range 20 {
+		input += octet(fmt.Sprintf("<13>m%d", i))
+	}
+	got, err := readAll(t, &errReader{input, errTimeout}, 100)
+	if !errors.Is(err, errTimeout) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(got) != 21 || got[0] != "<13>a" || got[20] != "<13>m19" {
+		t.Fatalf("got %d messages %q, want 21", len(got), got)
+	}
+}
+
+// A NUL read with nothing more buffered yet ends the frame, as in
+// indexTrailer.
+func TestLeftoverNULAtBufferEnd(t *testing.T) {
+	got, err := readAll(t, &oneChunkReader{chunks: []string{"12 <13>hello world\x00", "<13>two\n"}}, 0)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	if want := "<13>hello wo|rld|<13>two"; strings.Join(got, "|") != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

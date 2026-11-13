@@ -159,7 +159,7 @@ func (f *frameReader) recoverAfterCounted() ([]byte, error) {
 			f.scratch = msg[:0]
 		}
 	}()
-	for len(msg) < f.max {
+	for {
 		if _, _, ok := f.peekOctetCount(); ok {
 			if len(msg) > 0 {
 				f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", len(msg))
@@ -167,6 +167,11 @@ func (f *frameReader) recoverAfterCounted() ([]byte, error) {
 				f.recovered = true
 			}
 			return nil, nil
+		}
+		// Checked after the octet count, so a leftover of exactly the cap
+		// followed by a frame isn't read as the head of a long line.
+		if len(msg) >= f.max {
+			break
 		}
 		c, err := f.r.ReadByte()
 		if err != nil {
@@ -203,10 +208,7 @@ func (f *frameReader) nulEndsFrame() bool {
 	if f.r.Buffered() == 0 {
 		return true
 	}
-	b, err := f.r.Peek(1)
-	if err != nil {
-		return true
-	}
+	b, _ := f.r.Peek(1) // can't fail: a byte is buffered
 	switch b[0] {
 	case '<', '\r', '\n', 0:
 		return true
