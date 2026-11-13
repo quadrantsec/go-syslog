@@ -2,6 +2,7 @@ package syslog
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"io"
 	"net"
 	"net/netip"
@@ -149,4 +150,39 @@ func TestForgedProxyHeaderIsRefused(t *testing.T) {
 		t.Fatalf("plain TLS from an untrusted address: %v", err)
 	}
 	conn.Close()
+}
+
+// A client behind the trusted proxy whose handshake fails (here it rejects
+// the server's certificate) is still named: failures are what most need a
+// name.
+func TestProxySourceOnHandshakeFailure(t *testing.T) {
+	infos := newInfoLog()
+	server, addr := startTLSServer(t, RFC5424, newCollectHandler(), func(s *Server) {
+		s.SetConnHook(infos.hook)
+		s.SetProxyProtocol(loopback)
+	})
+	defer stop(t, server)
+
+	raw, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	hdr := &proxyproto.Header{Version: 2, Command: proxyproto.PROXY, TransportProtocol: proxyproto.TCPv4,
+		SourceAddr: deviceAddr, DestinationAddr: listenAddr}
+	if _, err := hdr.WriteTo(raw); err != nil {
+		t.Fatal(err)
+	}
+	cfg := getClientConfig()
+	cfg.RootCAs = x509.NewCertPool() // rejects the server's certificate
+	cfg.MaxVersion = tls.VersionTLS12
+	_ = raw.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := tls.Client(raw, cfg).Handshake(); err == nil {
+		t.Fatal("handshake succeeded with an empty trust store")
+	}
+
+	s := infos.waitClosed(t)
+	if s.CloseReason != CloseHandshakeFailed || !s.Proxied || s.Source != deviceAddr.String() {
+		t.Errorf("reason %q, proxied %v, source %s; want handshake_failed from %s", s.CloseReason, s.Proxied, s.Source, deviceAddr)
+	}
 }
