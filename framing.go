@@ -91,17 +91,18 @@ func (f *frameReader) next() ([]byte, error) {
 				_, _ = f.r.Discard(skip)
 				hdr -= skip
 				n = sn
-			} else if f.counted() {
-				// On a connection that has been sending small octet
-				// frames, nothing verifies a shorter length. Trusting this
-				// one would discard n bytes of what are probably good
-				// frames, so drop the header and resync on the next call.
+			} else if f.streak >= 1 {
+				// After an octet-counted frame, nothing verifies a shorter
+				// length. Trusting this one would discard n bytes of what
+				// are probably good frames (a miscounted first frame's
+				// digits glued onto the second's length), so drop the
+				// header and resync on the next call.
 				f.log("Skipped implausible octet count on octet-counted connection, length=%d, max_bytes=%d", n, f.max)
 				f.info.dropped(hdr, 0)
 				_, _ = f.r.Discard(hdr)
 				return nil, nil
 			}
-			// Otherwise (a fresh connection, where nothing can have been
+			// Otherwise (the first frame, where nothing can have been
 			// miscounted yet) it's an oversized frame: readCounted drops it.
 		}
 		if f.streak < 2 {
@@ -128,8 +129,84 @@ func (f *frameReader) next() ([]byte, error) {
 		// No octet count within a frame's worth of data: treat the
 		// connection as non-transparent from here on.
 	}
+	if f.streak == 1 {
+		return f.recoverAfterCounted()
+	}
 	f.streak = 0
 	return f.readToTrailer()
+}
+
+// recoverAfterCounted handles a frame that doesn't start with an octet count
+// right after one that did: usually the leftover of a miscounted first
+// frame. Reading to a trailer, as for non-transparent framing, waited until
+// the idle timeout on a sender that never sends one (FortiGate), losing
+// everything it sent meanwhile. Instead it scans forward and stops at
+// whichever comes first:
+//   - an octet count: the leftover is dropped, and the next call reads the
+//     frame;
+//   - an LF or NUL trailer: the bytes were a line after all (a
+//     non-transparent sender whose first line looked octet-counted). It's
+//     delivered, as before, and the connection reads on as non-transparent.
+func (f *frameReader) recoverAfterCounted() ([]byte, error) {
+	msg := f.scratch[:0]
+	defer func() {
+		if cap(msg) <= 64<<10 {
+			f.scratch = msg[:0]
+		}
+	}()
+	for len(msg) < f.max {
+		if _, _, ok := f.peekOctetCount(); ok {
+			if len(msg) > 0 {
+				f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", len(msg))
+				f.info.dropped(len(msg), 0)
+			}
+			return nil, nil
+		}
+		c, err := f.r.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) && len(msg) > 0 {
+				f.streak = 0
+				f.info.setFraming(FramingEOF)
+				return f.finishTrailer(msg, 0), err
+			}
+			if len(msg) > 0 {
+				f.info.dropped(len(msg), 1)
+			}
+			return nil, err
+		}
+		if c == '\n' || (c == 0 && f.nulEndsFrame()) {
+			f.streak = 0
+			if c == 0 {
+				f.info.setFraming(FramingNUL)
+			} else {
+				f.info.setFraming(FramingLF)
+			}
+			return f.finishTrailer(msg, 0), nil
+		}
+		msg = append(msg, c)
+	}
+	// A frame's worth with neither: drop it and read on as non-transparent.
+	f.log("Skipped unframed data on octet-counted connection, skipped_bytes=%d", len(msg))
+	f.info.dropped(len(msg), 0)
+	f.streak = 0
+	return nil, nil
+}
+
+// nulEndsFrame reports whether a NUL just read ends a frame: when the next
+// byte starts another (or nothing more is buffered yet), as in indexTrailer.
+func (f *frameReader) nulEndsFrame() bool {
+	if f.r.Buffered() == 0 {
+		return true
+	}
+	b, err := f.r.Peek(1)
+	if err != nil {
+		return true
+	}
+	switch b[0] {
+	case '<', '\r', '\n', 0:
+		return true
+	}
+	return false
 }
 
 // counted reports whether the connection has settled on octet counting.
@@ -257,6 +334,10 @@ func (f *frameReader) readToTrailer() ([]byte, error) {
 						f.info.setFraming(FramingEOF)
 					}
 					return f.finishTrailer(msg, dropped), err
+				}
+				// Cut off mid-message: count what's lost.
+				if len(msg)+dropped > 0 {
+					f.info.dropped(len(msg)+dropped, 1)
 				}
 				return nil, err
 			}

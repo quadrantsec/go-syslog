@@ -405,3 +405,94 @@ func BenchmarkFramesNewline(b *testing.B)      { benchmarkFrames(b, sampleLinux+
 func BenchmarkFramesLongNewline(b *testing.B) {
 	benchmarkFrames(b, "<134>"+strings.Repeat("x", 60000)+"\n")
 }
+
+// msgAt returns a distinct RFC 5424 FortiGate-style message.
+func msgAt(i int) string {
+	return fmt.Sprintf(`<189>1 2026-11-13T05:00:%02d-05:00 FGT-EDGE-01 - - - - logid="0000000013" seq=%d action="close"`, i%60, i)
+}
+
+// An undercounted first frame on an octet-only sender (no LF, like
+// FortiGate) used to send the reader looking for a trailer that never comes:
+// nothing more was delivered until the idle timeout.
+func TestUndercountedFirstFrameOctetOnly(t *testing.T) {
+	first := msgAt(0)
+	input := fmt.Sprintf("%d %s", len(first)-7, first)
+	for i := 1; i <= 50; i++ {
+		input += octet(msgAt(i))
+	}
+	got, err := readAll(t, strings.NewReader(input), 0)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(got) != 51 || got[0] != first[:len(first)-7] || got[50] != msgAt(50) {
+		t.Fatalf("got %d messages (first %q), want 51", len(got), got[0])
+	}
+}
+
+// Overcounted by exactly the next frame's header, the leftover starts with
+// '<' (the second frame's body): it's dropped, and reading carries on.
+func TestOvercountedFirstFrameOctetOnly(t *testing.T) {
+	first, second := msgAt(0), msgAt(1)
+	hdr := fmt.Sprintf("%d ", len(second))
+	input := fmt.Sprintf("%d %s", len(first)+len(hdr), first) + hdr + second
+	for i := 2; i <= 50; i++ {
+		input += octet(msgAt(i))
+	}
+	got, err := readAll(t, strings.NewReader(input), 0)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	// The first message carries the second's header; the second is lost.
+	if len(got) != 50 || got[len(got)-1] != msgAt(50) {
+		t.Fatalf("got %d messages, want 50 (the 2nd lost)", len(got))
+	}
+}
+
+// A miscounted first frame's digits glued onto the second frame's length make
+// a length over the cap. With the frames arriving one per read nothing can
+// verify a shorter suffix, and the huge length used to be trusted after one
+// frame: every later frame was discarded.
+func TestGluedLengthAfterFirstFrameSlowSender(t *testing.T) {
+	first := msgAt(0) + " sentbyte=13107"
+	chunks := []string{fmt.Sprintf("%d %s", len(first)-5, first)}
+	for i := 1; i <= 300; i++ {
+		chunks = append(chunks, octet(msgAt(i)))
+	}
+	got, err := readAll(t, &oneChunkReader{chunks: chunks}, 1<<20)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(got) < 299 || got[len(got)-1] != msgAt(300) {
+		t.Fatalf("delivered %d of 301", len(got))
+	}
+}
+
+// A non-transparent sender whose first line happens to look octet-counted
+// loses nothing it didn't lose before: the rest of that line is delivered,
+// and the following lines are read as lines.
+func TestLineSenderFirstLineLooksCounted(t *testing.T) {
+	got, err := readAll(t, strings.NewReader("12 <13>hello world\n<13>two\n<13>three\x00<13>four\n"), 0)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	want := []string{"<13>hello wo", "rld", "<13>two", "<13>three", "<13>four"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// oneChunkReader returns one chunk per Read, like a sender that writes one
+// frame at a time.
+type oneChunkReader struct{ chunks []string }
+
+func (c *oneChunkReader) Read(p []byte) (int, error) {
+	if len(c.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.chunks[0])
+	c.chunks[0] = c.chunks[0][n:]
+	if c.chunks[0] == "" {
+		c.chunks = c.chunks[1:]
+	}
+	return n, nil
+}
