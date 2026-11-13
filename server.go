@@ -303,13 +303,19 @@ func (s *Server) goReadConnection(connection net.Conn, info *ConnInfo) {
 		err := tlsConn.Handshake()
 		s.armDeadline(func() { _ = tlsConn.SetDeadline(time.Time{}) })
 		if err != nil {
+			// The PROXY header (if any) was read at the start of the
+			// handshake: record the client even though TLS failed, since
+			// failures are what most need a name.
+			if src := proxySource(connection); src != nil {
+				info.setSource(src)
+			}
 			reason, hint := HandshakeFailure(err)
 			if hint != "" {
 				hint = ", hint=" + hint
 			}
 			s.connLog("Failed to complete TLS handshake, closing connection, "+
-				"remote=%s, local=%s, reason=%s, error=%v%s",
-				info.Peer, info.Local, reason, err, hint,
+				"remote=%s, local=%s%s, reason=%s, error=%v%s",
+				info.Source(), info.Local, viaPeer(info), reason, err, hint,
 			)
 			info.close(CloseHandshakeFailed, err)
 			s.connEvent(ConnHandshakeFailed, info, err)
