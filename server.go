@@ -60,6 +60,7 @@ type Server struct {
 	tlsPeerNameFunc         TlsPeerNameFunc
 	connHook                ConnHook
 	quietConnLogs           bool
+	firstFrameFilter        FirstFrameFilter
 	proxyTrusted            []netip.Prefix
 	datagramPool            sync.Pool
 
@@ -391,7 +392,7 @@ func (s *Server) read(readCloser *ReadCloser, client string, tlsPeer string, inf
 			})
 		}
 		msg, err := frames.next()
-		if len(msg) > 0 {
+		if len(msg) > 0 && s.acceptFrame(info, msg) {
 			info.frame(msg)
 			s.parser(msg, client, tlsPeer)
 		}

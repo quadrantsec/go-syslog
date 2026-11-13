@@ -52,6 +52,7 @@ type ConnInfo struct {
 
 	bytes, frames                                atomic.Int64
 	droppedBytes, droppedFrames, truncatedFrames atomic.Int64
+	filteredBytes, filteredFrames                atomic.Int64 // rejected by the first-frame filter
 	lastFrameAt                                  atomic.Int64 // unix nanoseconds
 
 	mu          sync.Mutex
@@ -61,9 +62,14 @@ type ConnInfo struct {
 	peerCN      string
 	framing     string
 	lastFrame   []byte
-	closeReason string
-	closeError  string
-	closed      time.Time
+	// firstFrame is the start of the first frame handed to the parser,
+	// firstFiltered the start of the first frame the first-frame filter
+	// rejected.
+	firstFrame    []byte
+	firstFiltered []byte
+	closeReason   string
+	closeError    string
+	closed        time.Time
 }
 
 // ConnSnapshot is a ConnInfo at one moment.
@@ -87,10 +93,17 @@ type ConnSnapshot struct {
 	Framing         string     `json:"framing,omitempty"`
 	LastFrameAt     *time.Time `json:"last_frame_at,omitempty"`
 	LastFrame       string     `json:"last_frame,omitempty"`
-	Open            bool       `json:"open"`
-	ClosedAt        *time.Time `json:"closed_at,omitempty"`
-	CloseReason     string     `json:"close_reason,omitempty"`
-	CloseError      string     `json:"close_error,omitempty"`
+	// FirstFrame is the start of the first frame parsed. FilteredFrames and
+	// FilteredBytes count the opening frames the first-frame filter
+	// rejected, and FirstFiltered is the start of the first of them.
+	FirstFrame     string     `json:"first_frame,omitempty"`
+	FilteredFrames int64      `json:"filtered_frames,omitempty"`
+	FilteredBytes  int64      `json:"filtered_bytes,omitempty"`
+	FirstFiltered  string     `json:"first_filtered,omitempty"`
+	Open           bool       `json:"open"`
+	ClosedAt       *time.Time `json:"closed_at,omitempty"`
+	CloseReason    string     `json:"close_reason,omitempty"`
+	CloseError     string     `json:"close_error,omitempty"`
 }
 
 // newConnInfo starts the record for an accepted connection. It reads only
@@ -131,6 +144,10 @@ func (c *ConnInfo) Snapshot() ConnSnapshot {
 		TruncatedFrames: c.truncatedFrames.Load(),
 		Framing:         c.framing,
 		LastFrame:       string(c.lastFrame),
+		FirstFrame:      string(c.firstFrame),
+		FilteredFrames:  c.filteredFrames.Load(),
+		FilteredBytes:   c.filteredBytes.Load(),
+		FirstFiltered:   string(c.firstFiltered),
 		Open:            c.closed.IsZero(),
 		CloseReason:     c.closeReason,
 		CloseError:      c.closeError,
@@ -173,11 +190,30 @@ func (c *ConnInfo) setTLS(state tls.ConnectionState) {
 }
 
 func (c *ConnInfo) frame(msg []byte) {
-	c.frames.Add(1)
+	first := c.frames.Add(1) == 1
 	c.lastFrameAt.Store(time.Now().UnixNano())
 	c.mu.Lock()
 	c.lastFrame = append(c.lastFrame[:0], msg[:min(len(msg), lastFrameMax)]...)
+	if first {
+		c.firstFrame = append([]byte(nil), msg[:min(len(msg), lastFrameMax)]...)
+	}
 	c.mu.Unlock()
+}
+
+// filtered counts a frame the first-frame filter rejected.
+func (c *ConnInfo) filtered(msg []byte) {
+	c.filteredBytes.Add(int64(len(msg)))
+	if c.filteredFrames.Add(1) == 1 {
+		c.mu.Lock()
+		c.firstFiltered = append([]byte(nil), msg[:min(len(msg), lastFrameMax)]...)
+		c.mu.Unlock()
+	}
+}
+
+// FilteredFrames returns how many of the connection's opening frames the
+// first-frame filter has rejected so far.
+func (c *ConnInfo) FilteredFrames() int64 {
+	return c.filteredFrames.Load()
 }
 
 func (c *ConnInfo) setFraming(f string) {
