@@ -405,3 +405,226 @@ func BenchmarkFramesNewline(b *testing.B)      { benchmarkFrames(b, sampleLinux+
 func BenchmarkFramesLongNewline(b *testing.B) {
 	benchmarkFrames(b, "<134>"+strings.Repeat("x", 60000)+"\n")
 }
+
+// msgAt returns a distinct RFC 5424 FortiGate-style message.
+func msgAt(i int) string {
+	return fmt.Sprintf(`<189>1 2026-11-13T05:00:%02d-05:00 FGT-EDGE-01 - - - - logid="0000000013" seq=%d action="close"`, i%60, i)
+}
+
+// An undercounted first frame on an octet-only sender (no LF, like
+// FortiGate) used to send the reader looking for a trailer that never comes:
+// nothing more was delivered until the idle timeout.
+func TestUndercountedFirstFrameOctetOnly(t *testing.T) {
+	first := msgAt(0)
+	input := fmt.Sprintf("%d %s", len(first)-7, first)
+	for i := 1; i <= 50; i++ {
+		input += octet(msgAt(i))
+	}
+	// The sender then goes quiet until the idle timeout, as FortiGate
+	// does between bursts: everything before it must be out by then.
+	got, err := readAll(t, &errReader{input, errTimeout}, 0)
+	if !errors.Is(err, errTimeout) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(got) != 51 || got[0] != first[:len(first)-7] || got[50] != msgAt(50) {
+		t.Fatalf("got %d messages (first %q), want 51", len(got), got[0])
+	}
+}
+
+// Overcounted by exactly the next frame's header, the leftover starts with
+// '<' (the second frame's body): it's dropped, and reading carries on.
+func TestOvercountedFirstFrameOctetOnly(t *testing.T) {
+	first, second := msgAt(0), msgAt(1)
+	hdr := fmt.Sprintf("%d ", len(second))
+	input := fmt.Sprintf("%d %s", len(first)+len(hdr), first) + hdr + second
+	for i := 2; i <= 50; i++ {
+		input += octet(msgAt(i))
+	}
+	got, err := readAll(t, strings.NewReader(input), 0)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	// The first message carries the second's header; the second is lost.
+	if len(got) != 50 || got[len(got)-1] != msgAt(50) {
+		t.Fatalf("got %d messages, want 50 (the 2nd lost)", len(got))
+	}
+}
+
+// A miscounted first frame's digits glued onto the second frame's length make
+// a length over the cap. With the frames arriving one per read nothing can
+// verify a shorter suffix, and the huge length used to be trusted after one
+// frame: every later frame was discarded.
+func TestGluedLengthAfterFirstFrameSlowSender(t *testing.T) {
+	first := msgAt(0) + " sentbyte=13107"
+	chunks := []string{fmt.Sprintf("%d %s", len(first)-5, first)}
+	for i := 1; i <= 300; i++ {
+		chunks = append(chunks, octet(msgAt(i)))
+	}
+	got, err := readAll(t, &oneChunkReader{chunks: chunks}, 1<<20)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	// Only the frame whose length was glued is lost.
+	if len(got) != 300 || got[0] != first[:len(first)-5] || got[1] != msgAt(2) || got[299] != msgAt(300) {
+		t.Fatalf("delivered %d of 301, want all but the 2nd", len(got))
+	}
+}
+
+// A non-transparent sender whose first line happens to look octet-counted
+// loses nothing it didn't lose before: the rest of that line is delivered,
+// and the following lines are read as lines.
+func TestLineSenderFirstLineLooksCounted(t *testing.T) {
+	got, err := readAll(t, strings.NewReader("12 <13>hello world\n<13>two\n<13>three\x00<13>four\n"), 0)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	want := []string{"<13>hello wo", "rld", "<13>two", "<13>three", "<13>four"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// oneChunkReader returns one chunk per Read, like a sender that writes one
+// frame at a time.
+type oneChunkReader struct{ chunks []string }
+
+func (c *oneChunkReader) Read(p []byte) (int, error) {
+	if len(c.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.chunks[0])
+	c.chunks[0] = c.chunks[0][n:]
+	if c.chunks[0] == "" {
+		c.chunks = c.chunks[1:]
+	}
+	return n, nil
+}
+
+// While recovering, an octet count can turn up mid-line on a line sender
+// ("3 <b@...", "5.1.1 <user@..."). Reading it as a frame used to settle the
+// connection on octet counting, and resync then discarded up to a frame's
+// worth at a time, for the rest of the connection.
+func TestLineSenderLookalikeInLeftover(t *testing.T) {
+	for name, tc := range map[string]struct {
+		input, line string
+		n           int
+	}{
+		"first line": {"2 <a@example.com> 3 <b@example.com> bounced\n", sampleLinux, 500},
+		"mid-connection": {strings.Repeat(sampleLinux+"\n", 10) +
+			"  1 <postmaster@example.com>: 550 5.1.1 <user@example.com> rejected\n", sampleFTD, 300},
+	} {
+		got, err := readAll(t, strings.NewReader(tc.input+strings.Repeat(tc.line+"\n", tc.n)), 0)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+		n := 0
+		for _, m := range got {
+			if m == tc.line {
+				n++
+			}
+		}
+		if n != tc.n {
+			t.Errorf("%s: delivered %d of the %d lines after the counted-looking one", name, n, tc.n)
+		}
+	}
+}
+
+// The leftover of a line sender's counted-looking first line ends at an LF,
+// a NUL that ends a frame, or EOF, and is delivered; a NUL followed by more
+// text is part of the message.
+func TestLeftoverTrailers(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"12 <13>hello world\x00<13>two\x00", []string{"<13>hello wo", "rld", "<13>two"}},
+		{"12 <13>hello wor\x00ld\n<13>two\n", []string{"<13>hello wo", "r\x00ld", "<13>two"}},
+		{"12 <13>hello world\r\n<13>two\r\n", []string{"<13>hello wo", "rld", "<13>two"}},
+		{"12 <13>hello world", []string{"<13>hello wo", "rld"}},
+	} {
+		got, err := readAll(t, strings.NewReader(tc.in), 0)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("%q: err = %v", tc.in, err)
+		}
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("%q: got %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A leftover longer than the cap is the head of an oversized line: it's
+// delivered truncated, as any long line is, not dropped with the tail
+// delivered as a message of its own.
+func TestLongLeftoverKeepsHead(t *testing.T) {
+	long := "<13>1 - - - - - - " + strings.Repeat("x", 200)
+	got, err := readAll(t, strings.NewReader(octet(long)+long+"\n<13>next\n"), 100)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	// The counted copy is over the cap and dropped whole; the line after it
+	// is the leftover, and keeps its head.
+	want := []string{long[:100], "<13>next"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Exactly the cap, then EOF: all of it is delivered.
+	got, _ = readAll(t, strings.NewReader("1 <"+strings.Repeat("A", 100)), 100)
+	if len(got) != 2 || got[1] != strings.Repeat("A", 100) {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Data lost to a read error (a timeout, reset or Kill) mid-message is
+// counted, whichever way the message was framed.
+func TestErrorPathAccounting(t *testing.T) {
+	hdr := fmt.Sprintf("%d ", len(sampleFortiGate2))
+	for name, tc := range map[string]struct {
+		in            string
+		bytes, frames int64
+	}{
+		"leftover":  {octet(sampleFortiGate1) + "leftover-no-trailer", int64(len("leftover-no-trailer")), 1},
+		"line":      {sampleLinux + "\n" + "partial", int64(len("partial")), 1},
+		"octet":     {octet(sampleFortiGate1) + octet(sampleFortiGate2)[:40], int64(40 - len(hdr)), 1},
+		"oversized": {"99999999 <13>x", int64(len("<13>x")), 1},
+	} {
+		info := &ConnInfo{}
+		fr := newFrameReader(bufio.NewReader(&errReader{tc.in, errTimeout}), 0)
+		fr.info = info
+		for range 100 {
+			if _, err := fr.next(); err != nil {
+				break
+			}
+		}
+		if s := info.Snapshot(); s.DroppedBytes != tc.bytes || s.DroppedFrames != tc.frames {
+			t.Errorf("%s: dropped %d bytes, %d frames; want %d, %d", name, s.DroppedBytes, s.DroppedFrames, tc.bytes, tc.frames)
+		}
+	}
+}
+
+// A leftover of exactly the cap that ends at an octet count is dropped, and
+// the frames after it are read: it isn't the head of a long line.
+func TestLeftoverOfExactlyCapBeforeFrame(t *testing.T) {
+	input := "5 <13>a" + strings.Repeat("b", 100)
+	for i := range 20 {
+		input += octet(fmt.Sprintf("<13>m%d", i))
+	}
+	got, err := readAll(t, &errReader{input, errTimeout}, 100)
+	if !errors.Is(err, errTimeout) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(got) != 21 || got[0] != "<13>a" || got[20] != "<13>m19" {
+		t.Fatalf("got %d messages %q, want 21", len(got), got)
+	}
+}
+
+// A NUL read with nothing more buffered yet ends the frame, as in
+// indexTrailer.
+func TestLeftoverNULAtBufferEnd(t *testing.T) {
+	got, err := readAll(t, &oneChunkReader{chunks: []string{"12 <13>hello world\x00", "<13>two\n"}}, 0)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v", err)
+	}
+	if want := "<13>hello wo|rld|<13>two"; strings.Join(got, "|") != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

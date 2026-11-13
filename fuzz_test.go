@@ -2,7 +2,7 @@ package syslog
 
 import (
 	"bufio"
-	"bytes"
+	"io"
 	"testing"
 
 	"gopkg.in/mcuadros/go-syslog.v2/format"
@@ -24,28 +24,39 @@ func addFrameSeeds(f *testing.F) {
 }
 
 // FuzzFrameReader feeds arbitrary bytes through a tiny buffer, so frames
-// straddle buffer refills everywhere. The reader must not panic, must stop
-// at EOF, must never deliver more bytes than it read, and must honor the cap.
+// straddle buffer refills everywhere, ending at EOF or at a timeout. The
+// reader must not panic, must stop at the end, must honor the cap, and must
+// never deliver and count as dropped more bytes than it read.
 func FuzzFrameReader(f *testing.F) {
 	addFrameSeeds(f)
+	f.Add([]byte("2 <a@example.com> 3 <b@example.com> bounced\n<13>x\n"))
+	f.Add([]byte("12 <13>hello wor\x00ld\n<13>two\x00"))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		const max = 512
-		fr := newFrameReader(bufio.NewReaderSize(bytes.NewReader(data), 16), max)
-		total := 0
-		for range len(data) + 2 {
-			msg, err := fr.next()
-			if len(msg) > max {
-				t.Fatalf("message of %d bytes over the %d byte cap", len(msg), max)
-			}
-			total += len(msg)
-			if err != nil {
-				if total > len(data) {
-					t.Fatalf("delivered %d bytes from %d bytes of input", total, len(data))
+		for _, end := range []error{io.EOF, errTimeout} {
+			const max = 512
+			info := &ConnInfo{}
+			fr := newFrameReader(bufio.NewReaderSize(&errReader{string(data), end}, 16), max)
+			fr.info = info
+			total := 0
+			done := false
+			for range len(data) + 2 {
+				msg, err := fr.next()
+				if len(msg) > max {
+					t.Fatalf("message of %d bytes over the %d byte cap", len(msg), max)
 				}
-				return
+				total += len(msg)
+				if err != nil {
+					if dropped := info.Snapshot().DroppedBytes; int64(total)+dropped > int64(len(data)) {
+						t.Fatalf("delivered %d and dropped %d bytes from %d bytes of input", total, dropped, len(data))
+					}
+					done = true
+					break
+				}
+			}
+			if !done {
+				t.Fatalf("no end after %d calls on %d bytes", len(data)+2, len(data))
 			}
 		}
-		t.Fatalf("no EOF after %d calls on %d bytes", len(data)+2, len(data))
 	})
 }
 
